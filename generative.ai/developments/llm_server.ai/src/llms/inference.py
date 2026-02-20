@@ -49,9 +49,20 @@ class InferenceEngine:
             except Exception:
                 pass
 
-            # Move model to CPU before deleting (releases CUDA tensors)
+            # For device_map="auto" models, we must delete tied weight
+            # references and any dispatch wrapper state before del.
             try:
-                self.model.to("cpu")
+                self.model.tie_weights = lambda: None  # prevent re-tying
+            except Exception:
+                pass
+
+            # Attempt to move all parameters off GPU individually
+            # (model.to("cpu") fails with dispatch hooks / device_map)
+            try:
+                for param in self.model.parameters():
+                    param.data = torch.empty(0)
+                for buf in self.model.buffers():
+                    buf.data = torch.empty(0)
             except Exception:
                 pass
 
@@ -69,6 +80,11 @@ class InferenceEngine:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
+
+        # Second GC pass — catches reference cycles broken by the first
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     # ── Generate ───────────────────────────────────────────────────────
     def generate(self, prompt: str, **kwargs: Any) -> str:

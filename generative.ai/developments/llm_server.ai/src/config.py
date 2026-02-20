@@ -22,6 +22,10 @@ class ServerConfig:
     active_model: str = ""
     server_was_running: bool = False
     auto_restore: bool = True
+    hf_token: str = ""
+    model_dir: str = ""
+    theme: str = "tokyo-night"
+    log_level: str = "INFO"
     tuning: TuningParams = field(default_factory=TuningParams)
 
     # ── Persistence ────────────────────────────────────────────────────

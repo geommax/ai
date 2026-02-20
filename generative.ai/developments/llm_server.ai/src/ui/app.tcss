@@ -30,7 +30,7 @@ Footer {
     width: 30;
     background: #24283b;
     border-right: solid #414868;
-    padding: 1 0;
+    padding: 0;
     overflow-y: auto;
 }
 
@@ -39,6 +39,7 @@ Footer {
     text-style: bold;
     color: #7aa2f7;
     padding: 1 1 0 1;
+    height: auto;
 }
 
 .nav-subtitle {
@@ -103,7 +104,8 @@ Footer {
 #main-content {
     width: 1fr;
     background: #1a1b26;
-    padding: 0 0 0 1;
+    padding: 0;
+    overflow-y: auto;
 }
 
 /* ── Panel titles ──────────────────────────────────────────────────── */
@@ -113,6 +115,7 @@ Footer {
     color: #c0caf5;
     text-align: center;
     padding: 1;
+    height: auto;
     background: #24283b;
     margin: 0 0 1 0;
     border: solid #414868;
@@ -122,11 +125,13 @@ Footer {
 
 Button {
     margin: 0 1 0 0;
+    height: 3;
 }
 
 .btn-row {
     height: 3;
     margin: 1 0 0 0;
+    align: left middle;
 }
 
 /* ── DataTable ─────────────────────────────────────────────────────── */
@@ -189,4 +194,31 @@ RichLog {
 
 ContentSwitcher {
     height: 1fr;
+}
+
+/* ── Select ────────────────────────────────────────────────────────── */
+
+Select {
+    width: 30;
+    background: #1a1b26;
+}
+
+SelectCurrent {
+    background: #1a1b26;
+    border: solid #414868;
+    color: #c0caf5;
+}
+
+SelectCurrent:focus {
+    border: solid #7aa2f7;
+}
+
+SelectOverlay {
+    background: #24283b;
+    border: solid #414868;
+}
+
+OptionList > .option-list--option-highlighted {
+    background: #364a82;
+    color: #c0caf5;
 }

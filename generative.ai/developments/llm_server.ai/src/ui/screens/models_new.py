@@ -6,7 +6,7 @@ import time
 
 from textual import work
 from textual.app import ComposeResult
-from textual.containers import Container, Horizontal, Vertical
+from textual.containers import Container, Horizontal
 from textual.widgets import (
     Static,
     Button,
@@ -29,7 +29,6 @@ class ModelsScreen(Container):
     #search-row {
         height: 3;
         margin: 0 0 1 0;
-        align: left middle;
     }
     #search-input {
         width: 1fr;
@@ -57,7 +56,6 @@ class ModelsScreen(Container):
     .model-btn-row {
         height: 3;
         margin: 1 0 0 0;
-        align: left middle;
     }
     #dl-status {
         height: auto;
@@ -165,19 +163,36 @@ class ModelsScreen(Container):
         self.query_one("#btn-resume-dl", Button).display = False
 
         self._downloading_model_id: str | None = None
-        self._file_keys: list[str] = []
+        self._polling_download = False
+        self._dl_table_populated = False
+        self._file_statuses: dict[str, str] = {}
         self._refresh_downloaded()
+
+        # Check if a download is already in progress (daemon may have one running)
         self._check_existing_download()
 
-    # ── Refresh downloaded list (daemon client) ────────────────────
+    # ── Check existing download on mount ───────────────────────────
+    def _check_existing_download(self) -> None:
+        try:
+            state = self.app.client.download_status()  # type: ignore[attr-defined]
+            if state.get("active"):
+                self._downloading_model_id = state.get("model_id")
+                self._show_download_panel(state.get("model_id", ""))
+                self._start_polling()
+        except DaemonDisconnected:
+            pass
+
+    # ── Refresh downloaded list ────────────────────────────────────
     def _refresh_downloaded(self) -> None:
         client = self.app.client  # type: ignore[attr-defined]
         dtbl = self.query_one("#downloaded-models", DataTable)
         dtbl.clear()
+
         try:
             models = client.list_models()
         except DaemonDisconnected:
             return
+
         for m in models:
             status = (
                 "[green]● Loaded[/green]"
@@ -186,8 +201,8 @@ class ModelsScreen(Container):
             )
             dtbl.add_row(
                 m["repo_id"],
-                m.get("size_str", "?"),
-                str(m.get("nb_files", "?")),
+                m["size_str"],
+                str(m["nb_files"]),
                 status,
                 key=m["repo_id"],
             )
@@ -219,18 +234,21 @@ class ModelsScreen(Container):
         if event.input.id == "search-input" and event.value.strip():
             self._search_models(event.value.strip())
 
-    # ── Search (daemon client) ─────────────────────────────────────
+    # ── Background workers ─────────────────────────────────────────
     @work(thread=True, exclusive=True, group="search")
     def _search_models(self, query: str) -> None:
         client = self.app.client  # type: ignore[attr-defined]
         status = self.query_one("#dl-status", Static)
-        self.app.call_from_thread(status.update, f"Searching '{query}'…")
+        self.app.call_from_thread(status.update, f"Searching '{query}'...")
+
         try:
             results = client.search_models(query)
             self.app.call_from_thread(self._populate_search, results)
             self.app.call_from_thread(status.update, f"Found {len(results)} models")
         except DaemonDisconnected:
-            self.app.call_from_thread(status.update, "[red]Daemon offline[/red]")
+            self.app.call_from_thread(
+                status.update, "[red]Daemon offline[/red]"
+            )
         except Exception as exc:
             self.app.call_from_thread(
                 status.update, f"[red]Search error: {exc}[/red]"
@@ -248,7 +266,7 @@ class ModelsScreen(Container):
                 key=m["id"],
             )
 
-    # ── Download (daemon client + polling) ─────────────────────────
+    # ── Download with polling ──────────────────────────────────────
     def _download_selected(self) -> None:
         tbl = self.query_one("#search-results", DataTable)
         if tbl.cursor_row is not None and tbl.row_count > 0:
@@ -256,27 +274,29 @@ class ModelsScreen(Container):
             model_id = str(row_key.value)
             self._start_download(model_id)
         else:
-            self.app.notify(
+            self.app.notify(  # type: ignore[attr-defined]
                 "Select a model from search results first",
                 severity="warning",
             )
 
     def _start_download(self, model_id: str) -> None:
-        """Tell daemon to start downloading, then begin polling."""
         client = self.app.client  # type: ignore[attr-defined]
         try:
             result = client.download_model(model_id)
-            if not result.get("ok"):
-                self.app.notify(
+            if not result["ok"]:
+                self.app.notify(  # type: ignore[attr-defined]
                     result.get("error", "Download failed"), severity="error"
                 )
                 return
         except DaemonDisconnected:
-            self.app.notify("Daemon offline", severity="error")
+            self.app.notify("Daemon offline", severity="error")  # type: ignore[attr-defined]
             return
 
         self._downloading_model_id = model_id
-        # Show download panel
+        self._show_download_panel(model_id)
+        self._start_polling()
+
+    def _show_download_panel(self, model_id: str) -> None:
         panel = self.query_one("#dl-panel", Container)
         panel.display = True
         self.query_one("#dl-header", Static).update(
@@ -284,172 +304,152 @@ class ModelsScreen(Container):
         )
         ftbl = self.query_one("#dl-file-table", DataTable)
         ftbl.clear()
-        self._file_keys = []
-        self.query_one("#dl-progress", ProgressBar).update(total=100, progress=0)
+        pbar = self.query_one("#dl-progress", ProgressBar)
+        pbar.update(total=100, progress=0)
         self.query_one("#btn-stop-dl", Button).display = True
         self.query_one("#btn-resume-dl", Button).display = False
         self.query_one("#dl-status", Static).update("")
-        # Start polling loop
-        self._poll_download_loop()
+        self._dl_table_populated = False
+        self._file_statuses = {}
 
-    @work(thread=True, exclusive=True, group="download-poll")
+    def _start_polling(self) -> None:
+        if not self._polling_download:
+            self._polling_download = True
+            self._poll_download_loop()
+
+    @work(thread=True, exclusive=True, group="dl-poll")
     def _poll_download_loop(self) -> None:
-        """Poll daemon for download progress every 300ms."""
-        client = self.app.client  # type: ignore[attr-defined]
-        prev_file_count = 0
-
-        while True:
-            time.sleep(0.3)
+        """Poll daemon for download progress every 500ms."""
+        while self._polling_download:
             try:
-                st = client.download_status()
+                state = self.app.client.download_status()  # type: ignore[attr-defined]
             except DaemonDisconnected:
+                self._polling_download = False
                 self.app.call_from_thread(
-                    self.query_one("#dl-header", Static).update,
-                    "[red]Daemon disconnected[/red]",
+                    self.app.notify, "Daemon offline", severity="error"
                 )
                 break
 
-            phase = st.get("phase", "idle")
-            files = st.get("files", [])
-            pct = st.get("progress_pct", 0)
-            speed_str = st.get("speed_str", "—")
-            idx = st.get("current_idx", 0)
-            total = st.get("total_files", 0)
-            bytes_done = st.get("bytes_done", 0)
-            bytes_total = st.get("bytes_total", 0)
+            self.app.call_from_thread(self._update_download_ui, state)
 
-            # Rebuild file table when file count changes
-            if len(files) != prev_file_count:
-                self._rebuild_file_table(files)
-                prev_file_count = len(files)
-            else:
-                self._update_file_statuses(files)
-
-            # Progress bar
-            self.app.call_from_thread(
-                self.query_one("#dl-progress", ProgressBar).update,
-                total=100,
-                progress=min(pct, 100),
-            )
-
-            # Overall label
-            size_done = self._human_size(bytes_done)
-            size_total = self._human_size(bytes_total)
-            self.app.call_from_thread(
-                self.query_one("#dl-overall-label", Static).update,
-                f"  [{idx}/{total}]  {size_done} / {size_total}  ⚡ {speed_str}",
-            )
-
-            # Terminal states
-            if phase == "completed":
-                self.app.call_from_thread(
-                    self.query_one("#dl-progress", ProgressBar).update,
-                    total=100,
-                    progress=100,
-                )
-                self.app.call_from_thread(
-                    self.query_one("#dl-header", Static).update,
-                    f"[green]✓  Download complete — {self._downloading_model_id}[/green]",
-                )
-                self.app.call_from_thread(
-                    setattr,
-                    self.query_one("#btn-stop-dl", Button),
-                    "display",
-                    False,
-                )
-                self.app.call_from_thread(self._refresh_downloaded)
-                self.app.call_from_thread(
-                    self.app.notify,
-                    f"Model {self._downloading_model_id} downloaded ✓",
-                )
-                self._downloading_model_id = None
+            phase = state.get("phase", "idle")
+            if phase in ("completed", "cancelled", "error", "idle"):
+                self._polling_download = False
                 break
 
-            elif phase == "cancelled":
-                self.app.call_from_thread(
-                    self.query_one("#dl-header", Static).update,
-                    f"[yellow]⏸  Paused:[/yellow] {self._downloading_model_id}",
-                )
-                self.app.call_from_thread(
-                    setattr,
-                    self.query_one("#btn-stop-dl", Button),
-                    "display",
-                    False,
-                )
-                self.app.call_from_thread(
-                    setattr,
-                    self.query_one("#btn-resume-dl", Button),
-                    "display",
-                    True,
-                )
-                self.app.call_from_thread(
-                    self.app.notify,
-                    "Download stopped — press Resume to continue",
-                    severity="warning",
-                )
-                break
+            time.sleep(0.5)
 
-            elif phase == "error":
-                err = st.get("error", "Unknown error")
-                self.app.call_from_thread(
-                    self.query_one("#dl-header", Static).update,
-                    f"[red]✗  Error:[/red] {err}",
-                )
-                self.app.call_from_thread(
-                    setattr,
-                    self.query_one("#btn-stop-dl", Button),
-                    "display",
-                    False,
-                )
-                self._downloading_model_id = None
-                break
+    def _update_download_ui(self, state: dict) -> None:
+        """Update download UI elements from polled state."""
+        phase = state.get("phase", "idle")
+        files = state.get("files", [])
+        model_id = state.get("model_id", "")
 
-            elif phase == "idle" and not st.get("active"):
-                break
-
-    def _rebuild_file_table(self, files: list) -> None:
-        """Rebuild the download file table from scratch."""
         ftbl = self.query_one("#dl-file-table", DataTable)
-        self.app.call_from_thread(ftbl.clear)
-        self._file_keys = []
-        status_map = {
-            "pending": "[dim]⏳ pending[/dim]",
-            "downloading": "[cyan]⬇  downloading[/cyan]",
-            "done": "[green]✓  done[/green]",
-            "stopped": "[yellow]⏸ stopped[/yellow]",
-        }
+        pbar = self.query_one("#dl-progress", ProgressBar)
+        overall_lbl = self.query_one("#dl-overall-label", Static)
+        header = self.query_one("#dl-header", Static)
+
+        # Populate file table once
+        if files and not self._dl_table_populated:
+            ftbl.clear()
+            self._file_statuses = {}
+            for f in files:
+                key = f["name"]
+                ftbl.add_row(
+                    "[dim]⏳ pending[/dim]",
+                    f["name"],
+                    f.get("size_str", ""),
+                    key=key,
+                )
+                self._file_statuses[key] = "pending"
+            self._dl_table_populated = True
+
+        # Update changed file statuses
         for f in files:
-            key = f["name"]
-            self._file_keys.append(key)
-            icon = status_map.get(f.get("status", "pending"), "[dim]⏳ pending[/dim]")
-            self.app.call_from_thread(
-                ftbl.add_row, icon, f["name"], f.get("size_str", "?"), key=key
+            fname = f["name"]
+            fstatus = f.get("status", "pending")
+            if self._file_statuses.get(fname) != fstatus:
+                self._update_file_row(ftbl, fname, self._status_label(fstatus))
+                self._file_statuses[fname] = fstatus
+
+        # Progress bar
+        pct = state.get("progress_pct", 0)
+        pbar.update(total=100, progress=min(pct, 100))
+
+        # Overall label with speed
+        idx = state.get("current_idx", 0)
+        total = state.get("total_files", 0)
+        speed_str = state.get("speed_str", "—")
+        bytes_done = state.get("bytes_done", 0)
+        bytes_total = state.get("bytes_total", 0)
+
+        if phase == "downloading":
+            done_str = self._human_size(bytes_done)
+            total_str = self._human_size(bytes_total)
+            overall_lbl.update(
+                f"  [{idx}/{total}]  {done_str} / {total_str}  ⚡ {speed_str}"
+            )
+        elif phase == "preparing":
+            overall_lbl.update("  Preparing download…")
+
+        # Handle terminal phases
+        if phase == "completed":
+            pbar.update(total=100, progress=100)
+            header.update(f"[green]✓  Download complete — {model_id}[/green]")
+            self.query_one("#btn-stop-dl", Button).display = False
+            self._refresh_downloaded()
+            self.app.notify(f"Model {model_id} downloaded ✓")  # type: ignore[attr-defined]
+            self._downloading_model_id = None
+
+        elif phase == "cancelled":
+            header.update(f"[yellow]⏸  Paused:[/yellow] {model_id}")
+            self.query_one("#btn-stop-dl", Button).display = False
+            self.query_one("#btn-resume-dl", Button).display = True
+            self.app.notify(  # type: ignore[attr-defined]
+                "Download stopped — press Resume to continue",
+                severity="warning",
             )
 
-    def _update_file_statuses(self, files: list) -> None:
-        """Update per-file status icons in the download table."""
-        ftbl = self.query_one("#dl-file-table", DataTable)
-        status_map = {
-            "pending": "[dim]⏳ pending[/dim]",
-            "downloading": "[cyan]⬇  downloading[/cyan]",
-            "done": "[green]✓  done[/green]",
-            "stopped": "[yellow]⏸ stopped[/yellow]",
-        }
+        elif phase == "error":
+            err = state.get("error", "Unknown error")
+            header.update(f"[red]✗  Error:[/red] {err}")
+            self.query_one("#btn-stop-dl", Button).display = False
+            self._downloading_model_id = None
+
+    @staticmethod
+    def _status_label(status: str) -> str:
+        if status == "downloading":
+            return "[cyan]⬇  downloading[/cyan]"
+        elif status == "done":
+            return "[green]✓  done[/green]"
+        elif status == "stopped":
+            return "[yellow]⏸ stopped[/yellow]"
+        else:
+            return "[dim]⏳ pending[/dim]"
+
+    @staticmethod
+    def _human_size(nbytes: int) -> str:
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if nbytes < 1024:
+                return f"{nbytes:.1f} {unit}"
+            nbytes /= 1024  # type: ignore[assignment]
+        return f"{nbytes:.1f} PB"
+
+    # ── Helpers: update file row in DataTable ──────────────────────
+    def _update_file_row(
+        self, ftbl: DataTable, fname: str, status_text: str
+    ) -> None:
         try:
             from textual.widgets._data_table import RowKey
 
+            row_key = RowKey(fname)
             col_key = ftbl.columns[list(ftbl.columns.keys())[0]].key
-            for f in files:
-                icon = status_map.get(f.get("status", "pending"), "[dim]?[/dim]")
-                try:
-                    self.app.call_from_thread(
-                        ftbl.update_cell, RowKey(f["name"]), col_key, icon
-                    )
-                except Exception:
-                    pass
+            ftbl.update_cell(row_key, col_key, status_text)
         except Exception:
             pass
 
+    # ── Download actions ───────────────────────────────────────────
     def _stop_download(self) -> None:
         try:
             self.app.client.cancel_download()  # type: ignore[attr-defined]
@@ -458,49 +458,21 @@ class ModelsScreen(Container):
             self.app.notify("Daemon offline", severity="error")  # type: ignore[attr-defined]
 
     def _resume_download(self) -> None:
-        """Resume = re-run download; already-fetched files are auto-skipped."""
         if self._downloading_model_id:
             mid = self._downloading_model_id
             self.app.notify(f"Resuming {mid}…")  # type: ignore[attr-defined]
             self._start_download(mid)
 
-    def _check_existing_download(self) -> None:
-        """If daemon has an active download, show the panel and start polling."""
-        try:
-            st = self.app.client.download_status()  # type: ignore[attr-defined]
-            if st.get("active"):
-                model_id = st.get("model_id", "?")
-                self._downloading_model_id = model_id
-                panel = self.query_one("#dl-panel", Container)
-                panel.display = True
-                self.query_one("#dl-header", Static).update(
-                    f"⬇  Downloading [b]{model_id}[/b]"
-                )
-                self.query_one("#btn-stop-dl", Button).display = True
-                self.query_one("#btn-resume-dl", Button).display = False
-                self._poll_download_loop()
-        except DaemonDisconnected:
-            pass
-
-    # ── Load / Unload / Delete (daemon client) ─────────────────────
-    def _load_selected(self) -> None:
-        dtbl = self.query_one("#downloaded-models", DataTable)
-        if dtbl.cursor_row is not None and dtbl.row_count > 0:
-            row_key, _ = dtbl.coordinate_to_cell_key(dtbl.cursor_coordinate)
-            model_id = str(row_key.value)
-            self._do_load(model_id)
-        else:
-            self.app.notify(  # type: ignore[attr-defined]
-                "Select a downloaded model first", severity="warning"
-            )
-
+    # ── Load / Unload / Delete ─────────────────────────────────────
     @work(thread=True, exclusive=True, group="load")
     def _do_load(self, model_id: str) -> None:
         status = self.query_one("#dl-status", Static)
-        self.app.call_from_thread(status.update, f"Loading [b]{model_id}[/b]…")
+        self.app.call_from_thread(
+            status.update, f"Loading [b]{model_id}[/b]…"
+        )
         try:
             result = self.app.client.load_model(model_id)  # type: ignore[attr-defined]
-            if result.get("ok"):
+            if result["ok"]:
                 self.app.call_from_thread(
                     status.update, f"[green]✓ Model {model_id} loaded[/green]"
                 )
@@ -510,28 +482,39 @@ class ModelsScreen(Container):
                     self.app.notify, f"Model loaded: {model_id}"
                 )
             else:
-                err = result.get("error", "Failed")
                 self.app.call_from_thread(
-                    status.update, f"[red]Load error: {err}[/red]"
+                    status.update,
+                    f"[red]Load error: {result.get('error', '?')}[/red]",
                 )
         except DaemonDisconnected:
-            self.app.call_from_thread(status.update, "[red]Daemon offline[/red]")
+            self.app.call_from_thread(
+                status.update, "[red]Daemon offline[/red]"
+            )
+
+    def _load_selected(self) -> None:
+        dtbl = self.query_one("#downloaded-models", DataTable)
+        if dtbl.cursor_row is not None and dtbl.row_count > 0:
+            row_key, _ = dtbl.coordinate_to_cell_key(dtbl.cursor_coordinate)
+            model_id = str(row_key.value)
+            self._do_load(model_id)
+        else:
+            self.app.notify("Select a downloaded model first", severity="warning")  # type: ignore[attr-defined]
 
     def _unload_model(self) -> None:
         app = self.app  # type: ignore[attr-defined]
         try:
             result = app.client.unload_model()
-            if result.get("ok"):
+            if result["ok"]:
                 app.notify("Model unloaded")
+                self._refresh_downloaded()
                 self.query_one("#dl-status", Static).update(
                     "[yellow]Model unloaded[/yellow]"
                 )
+                app.update_sidebar_status()
             else:
                 app.notify(result.get("error", "Failed"), severity="warning")
         except DaemonDisconnected:
             app.notify("Daemon offline", severity="error")
-        self._refresh_downloaded()
-        app.update_sidebar_status()
 
     def _delete_selected(self) -> None:
         dtbl = self.query_one("#downloaded-models", DataTable)
@@ -539,44 +522,18 @@ class ModelsScreen(Container):
             row_key, _ = dtbl.coordinate_to_cell_key(dtbl.cursor_coordinate)
             model_id = str(row_key.value)
             app = self.app  # type: ignore[attr-defined]
-
-            from src.ui.dialogs import ConfirmDialog
-
-            def on_confirm(confirmed: bool) -> None:
-                if confirmed:
-                    try:
-                        result = app.client.delete_model(model_id)
-                        if result.get("ok"):
-                            app.notify(f"Deleted {model_id}")
-                        else:
-                            app.notify(
-                                result.get("error", f"Could not delete {model_id}"),
-                                severity="error",
-                            )
-                    except DaemonDisconnected:
-                        app.notify("Daemon offline", severity="error")
-                    self._refresh_downloaded()
-                    app.update_sidebar_status()
-
-            app.push_screen(
-                ConfirmDialog(
-                    f"Permanently delete all files for\n"
-                    f"[b]{model_id}[/b]?\n\n"
-                    f"This cannot be undone.",
-                    title="🗑  Delete Model",
-                ),
-                on_confirm,
-            )
+            try:
+                result = app.client.delete_model(model_id)
+                if result.get("ok"):
+                    app.notify(f"Deleted {model_id}")
+                else:
+                    app.notify(
+                        result.get("error", f"Could not delete {model_id}"),
+                        severity="error",
+                    )
+            except DaemonDisconnected:
+                app.notify("Daemon offline", severity="error")
+            self._refresh_downloaded()
+            app.update_sidebar_status()
         else:
-            self.app.notify(  # type: ignore[attr-defined]
-                "Select a model first", severity="warning"
-            )
-
-    # ── Helpers ────────────────────────────────────────────────────
-    @staticmethod
-    def _human_size(nbytes: int) -> str:
-        for unit in ("B", "KB", "MB", "GB", "TB"):
-            if nbytes < 1024:
-                return f"{nbytes:.1f} {unit}"
-            nbytes /= 1024  # type: ignore[assignment]
-        return f"{nbytes:.1f} PB"
+            self.app.notify("Select a model first", severity="warning")  # type: ignore[attr-defined]

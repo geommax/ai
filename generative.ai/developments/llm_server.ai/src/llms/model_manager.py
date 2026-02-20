@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -16,6 +17,72 @@ from huggingface_hub import HfApi, scan_cache_dir, snapshot_download, hf_hub_dow
 
 class DownloadCancelled(Exception):
     """Raised when a download is stopped by the user."""
+
+
+class _ProgressTracker:
+    """Collects real-time byte-level progress from tqdm bars.
+
+    ``hf_hub_download`` creates one tqdm bar per file.  We monkey-patch
+    ``tqdm.update()`` so that every chunk written triggers our callback
+    with accurate bytes-done and speed.
+    """
+
+    def __init__(
+        self,
+        files_info: List[Dict[str, Any]],
+        on_progress: Optional[Callable] = None,
+    ) -> None:
+        self.files_info = files_info
+        self.on_progress = on_progress
+        self._file_set = {f["name"] for f in files_info}
+        self._total_bytes = sum(f["size"] for f in files_info)
+        self._completed_bytes = 0        # bytes from fully-done files
+        self._current_file_bytes = 0     # bytes of file being downloaded NOW
+        self._current_fname: str = ""
+        self._current_idx: int = 0
+        self._done_files: set[str] = set()
+        self._download_start = time.monotonic()
+        self._lock = threading.Lock()
+
+    @property
+    def bytes_done(self) -> int:
+        with self._lock:
+            return self._completed_bytes + self._current_file_bytes
+
+    @property
+    def speed(self) -> float:
+        elapsed = time.monotonic() - self._download_start
+        return self.bytes_done / elapsed if elapsed > 0.5 else 0.0
+
+    def file_start(self, fname: str, idx: int) -> None:
+        with self._lock:
+            self._current_fname = fname
+            self._current_idx = idx
+            self._current_file_bytes = 0
+
+    def file_done(self, fname: str, fsize: int) -> None:
+        with self._lock:
+            self._completed_bytes += fsize
+            self._current_file_bytes = 0
+            self._done_files.add(fname)
+
+    def tqdm_update(self, n_bytes: int) -> None:
+        """Called from the patched tqdm.update with chunk size."""
+        with self._lock:
+            self._current_file_bytes += n_bytes
+        # Fire callback
+        if self.on_progress:
+            bd = self.bytes_done
+            pct = (bd / self._total_bytes * 100) if self._total_bytes else 0
+            self.on_progress(
+                self._current_fname,
+                self._current_idx,
+                len(self.files_info),
+                bd,
+                self._total_bytes,
+                "downloading",
+                self.speed,
+            )
 
 
 class ModelManager:
@@ -87,17 +154,11 @@ class ModelManager:
         on_progress: Optional[Callable] = None,
         on_file_list: Optional[Callable] = None,
     ) -> str:
-        """Download with detailed per-file progress.
+        """Download with detailed per-file + byte-level progress.
 
-        Parameters
-        ----------
-        on_file_list(files):
-            Called once with the full list of
-            ``[{"name": str, "size": int, "size_str": str}, ...]``
-            before downloading begins.
-        on_progress(file_name, file_idx, total_files, bytes_done, bytes_total, status):
-            Called before each file starts (``status="downloading"``)
-            and after it finishes (``status="done"``).
+        Uses tqdm monkey-patching to capture real-time byte progress
+        from ``hf_hub_download`` regardless of backend (hf_transfer
+        or plain requests).
         """
         self._cancel_event.clear()
 
@@ -122,10 +183,10 @@ class ModelManager:
         if on_file_list:
             on_file_list(files_info)
 
-        bytes_done = 0
+        # ── Progress tracker ───────────────────────────────────────
+        tracker = _ProgressTracker(files_info, on_progress)
+
         last_path = ""
-        download_start = time.monotonic()
-        speed = 0.0  # bytes per second
 
         for idx, sibling in enumerate(siblings, 1):
             # ── Cancel gate ────────────────────────────────────────
@@ -136,29 +197,54 @@ class ModelManager:
 
             fname = sibling.rfilename
             fsize = getattr(sibling, "size", 0) or 0
+            tracker.file_start(fname, idx)
 
+            # Notify "downloading" status
             if on_progress:
-                on_progress(fname, idx, total_files, bytes_done, total_bytes, "downloading", speed)
+                bd = tracker.bytes_done
+                on_progress(
+                    fname, idx, total_files, bd, total_bytes,
+                    "downloading", tracker.speed,
+                )
 
-            file_start = time.monotonic()
-            last_path = hf_hub_download(
-                model_id,
-                filename=fname,
-                cache_dir=str(self.hub_cache),
-            )
-            file_elapsed = time.monotonic() - file_start
-            bytes_done += fsize
+            # ── Monkey-patch tqdm to capture byte-level progress ──
+            import tqdm as _tqdm_mod
+            _orig_init = _tqdm_mod.tqdm.__init__
+            _orig_update = _tqdm_mod.tqdm.update
+            _this_tracker = tracker  # closure capture
 
-            # Calculate speed: use per-file speed for responsiveness,
-            # but fall back to overall average if file was cached (< 0.1s)
-            if file_elapsed > 0.1 and fsize > 0:
-                speed = fsize / file_elapsed
-            elif bytes_done > 0:
-                total_elapsed = time.monotonic() - download_start
-                speed = bytes_done / total_elapsed if total_elapsed > 0 else 0.0
+            def _patched_init(self_bar, *a: Any, **kw: Any) -> None:
+                _orig_init(self_bar, *a, **kw)
+                self_bar._llm_patched = True
 
+            def _patched_update(self_bar, n: int = 1) -> None:
+                _orig_update(self_bar, n)
+                if getattr(self_bar, "_llm_patched", False):
+                    _this_tracker.tqdm_update(n)
+
+            _tqdm_mod.tqdm.__init__ = _patched_init  # type: ignore[assignment]
+            _tqdm_mod.tqdm.update = _patched_update  # type: ignore[assignment]
+
+            try:
+                last_path = hf_hub_download(
+                    model_id,
+                    filename=fname,
+                    cache_dir=str(self.hub_cache),
+                )
+            finally:
+                # Always restore tqdm
+                _tqdm_mod.tqdm.__init__ = _orig_init  # type: ignore[assignment]
+                _tqdm_mod.tqdm.update = _orig_update  # type: ignore[assignment]
+
+            tracker.file_done(fname, fsize)
+
+            # Notify "done" status
             if on_progress:
-                on_progress(fname, idx, total_files, bytes_done, total_bytes, "done", speed)
+                bd = tracker.bytes_done
+                on_progress(
+                    fname, idx, total_files, bd, total_bytes,
+                    "done", tracker.speed,
+                )
 
         # Return the snapshot directory (parent of files)
         return str(Path(last_path).parent) if last_path else ""
@@ -180,6 +266,10 @@ class ModelManager:
                     revisions = [r.commit_hash for r in repo.revisions]
                     strategy = cache_info.delete_revisions(*revisions)
                     strategy.execute()
+                    # Remove .trash so files are permanently deleted
+                    trash_dir = self.hub_cache / ".trash"
+                    if trash_dir.exists():
+                        shutil.rmtree(trash_dir, ignore_errors=True)
                     return True
             return False
         except Exception:
