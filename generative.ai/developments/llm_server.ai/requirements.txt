@@ -1,11 +1,21 @@
-textual>=0.85.0
+# ── PyTorch (CUDA 12.8) ────────────────────────────────────────────
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch>=2.1.0
+
+# ── Core ───────────────────────────────────────────────────────────
 fastapi>=0.115.0
 uvicorn[standard]>=0.32.0
+pydantic>=2.9.0
+
+# ── LLM / HuggingFace ─────────────────────────────────────────────
 transformers>=4.46.0
-torch>=2.1.0
 huggingface-hub>=0.26.0
 accelerate>=0.35.0
+safetensors>=0.4.0
+
+# ── TUI ────────────────────────────────────────────────────────────
+textual>=0.85.0
 rich>=13.9.0
-pydantic>=2.9.0
-# llama-cpp-python is installed separately (needs CUDA build)
-# llama-cpp-python>=0.3.0
+
+# ── llama-cpp-python (installed separately — needs CUDA build)
+# CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python

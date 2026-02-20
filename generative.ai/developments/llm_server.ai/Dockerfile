@@ -48,7 +48,10 @@ COPY --from=builder /usr/lib/python3/dist-packages /usr/lib/python3/dist-package
 
 # ── Python dependencies ───────────────────────────────────────────────
 COPY requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir -r /tmp/requirements.txt && rm /tmp/requirements.txt
+RUN pip install --no-cache-dir \
+        torch --extra-index-url https://download.pytorch.org/whl/cu128 \
+    && pip install --no-cache-dir -r /tmp/requirements.txt \
+    && rm /tmp/requirements.txt
 
 # ── App code ───────────────────────────────────────────────────────────
 WORKDIR /app
