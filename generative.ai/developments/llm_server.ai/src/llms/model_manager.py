@@ -2,87 +2,23 @@
 
 from __future__ import annotations
 
+import fcntl
 import os
+import re
 import shutil
+import signal
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-# Enable hf_transfer for multi-connection parallel downloads
-os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
-
-from huggingface_hub import HfApi, scan_cache_dir, snapshot_download, hf_hub_download
+from huggingface_hub import HfApi, scan_cache_dir, snapshot_download
 
 
 class DownloadCancelled(Exception):
     """Raised when a download is stopped by the user."""
-
-
-class _ProgressTracker:
-    """Collects real-time byte-level progress from tqdm bars.
-
-    ``hf_hub_download`` creates one tqdm bar per file.  We monkey-patch
-    ``tqdm.update()`` so that every chunk written triggers our callback
-    with accurate bytes-done and speed.
-    """
-
-    def __init__(
-        self,
-        files_info: List[Dict[str, Any]],
-        on_progress: Optional[Callable] = None,
-    ) -> None:
-        self.files_info = files_info
-        self.on_progress = on_progress
-        self._file_set = {f["name"] for f in files_info}
-        self._total_bytes = sum(f["size"] for f in files_info)
-        self._completed_bytes = 0        # bytes from fully-done files
-        self._current_file_bytes = 0     # bytes of file being downloaded NOW
-        self._current_fname: str = ""
-        self._current_idx: int = 0
-        self._done_files: set[str] = set()
-        self._download_start = time.monotonic()
-        self._lock = threading.Lock()
-
-    @property
-    def bytes_done(self) -> int:
-        with self._lock:
-            return self._completed_bytes + self._current_file_bytes
-
-    @property
-    def speed(self) -> float:
-        elapsed = time.monotonic() - self._download_start
-        return self.bytes_done / elapsed if elapsed > 0.5 else 0.0
-
-    def file_start(self, fname: str, idx: int) -> None:
-        with self._lock:
-            self._current_fname = fname
-            self._current_idx = idx
-            self._current_file_bytes = 0
-
-    def file_done(self, fname: str, fsize: int) -> None:
-        with self._lock:
-            self._completed_bytes += fsize
-            self._current_file_bytes = 0
-            self._done_files.add(fname)
-
-    def tqdm_update(self, n_bytes: int) -> None:
-        """Called from the patched tqdm.update with chunk size."""
-        with self._lock:
-            self._current_file_bytes += n_bytes
-        # Fire callback
-        if self.on_progress:
-            bd = self.bytes_done
-            pct = (bd / self._total_bytes * 100) if self._total_bytes else 0
-            self.on_progress(
-                self._current_fname,
-                self._current_idx,
-                len(self.files_info),
-                bd,
-                self._total_bytes,
-                "downloading",
-                self.speed,
-            )
 
 
 class ModelManager:
@@ -94,6 +30,7 @@ class ModelManager:
         )
         self.hub_cache = self.cache_dir / "hub"
         self._cancel_event = threading.Event()
+        self._dl_process: Optional[subprocess.Popen] = None
 
     # ── List downloaded models ─────────────────────────────────────────
     def list_downloaded_models(self) -> List[Dict[str, Any]]:
@@ -102,6 +39,19 @@ class ModelManager:
             models: list[dict] = []
             for repo in cache_info.repos:
                 if repo.repo_type == "model":
+                    # Detect model format from file extensions
+                    file_exts = set()
+                    for rev in repo.revisions:
+                        for f in rev.files:
+                            file_exts.add(Path(f.file_path).suffix)
+                    if ".gguf" in file_exts:
+                        fmt = "gguf"
+                    elif ".safetensors" in file_exts:
+                        fmt = "safetensors"
+                    elif ".bin" in file_exts:
+                        fmt = "pytorch"
+                    else:
+                        fmt = "unknown"
                     models.append(
                         {
                             "repo_id": repo.repo_id,
@@ -109,6 +59,7 @@ class ModelManager:
                             "size_str": self._human_size(repo.size_on_disk),
                             "nb_files": repo.nb_files,
                             "last_modified": repo.last_modified,
+                            "format": fmt,
                             "revisions": [
                                 r.commit_hash[:10] for r in repo.revisions
                             ],
@@ -148,25 +99,50 @@ class ModelManager:
         )
         return path
 
+    def list_repo_files(
+        self, model_id: str
+    ) -> List[Dict[str, Any]]:
+        """Return the file manifest for *model_id* (name, size, size_str)."""
+        api = HfApi()
+        info = api.model_info(model_id, files_metadata=True)
+        result: List[Dict[str, Any]] = []
+        for s in (info.siblings or []):
+            fsize = getattr(s, "size", 0) or 0
+            result.append({
+                "name": s.rfilename,
+                "size": fsize,
+                "size_str": self._human_size(fsize),
+            })
+        return result
+
     def download_model_with_progress(
         self,
         model_id: str,
         on_progress: Optional[Callable] = None,
         on_file_list: Optional[Callable] = None,
+        filenames: Optional[List[str]] = None,
     ) -> str:
-        """Download with detailed per-file + byte-level progress.
+        """Download using ``huggingface-cli download`` as a subprocess.
 
-        Uses tqdm monkey-patching to capture real-time byte progress
-        from ``hf_hub_download`` regardless of backend (hf_transfer
-        or plain requests).
+        Cancellation is 100 % reliable — ``process.terminate()`` closes
+        all network connections instantly.
+
+        Parameters
+        ----------
+        filenames:
+            If given, only these files are downloaded (e.g. a single
+            GGUF variant).  ``None`` means download everything.
         """
         self._cancel_event.clear()
 
+        # ── File manifest (for UI) ─────────────────────────────────
         api = HfApi()
         info = api.model_info(model_id, files_metadata=True)
         siblings = info.siblings or []
+        if filenames:
+            selected = set(filenames)
+            siblings = [s for s in siblings if s.rfilename in selected]
 
-        # Build file manifest
         files_info: List[Dict[str, Any]] = []
         for s in siblings:
             fsize = getattr(s, "size", 0) or 0
@@ -179,79 +155,168 @@ class ModelManager:
         total_bytes = sum(f["size"] for f in files_info)
         total_files = len(files_info)
 
-        # Notify UI of the full file list
         if on_file_list:
             on_file_list(files_info)
 
-        # ── Progress tracker ───────────────────────────────────────
-        tracker = _ProgressTracker(files_info, on_progress)
+        # ── Build command ──────────────────────────────────────────
+        hf_cli = str(Path(sys.executable).parent / "huggingface-cli")
+        cmd = [hf_cli, "download", model_id]
+        if filenames:
+            cmd.extend(filenames)
+        cmd.extend(["--cache-dir", str(self.hub_cache)])
 
-        last_path = ""
+        env = os.environ.copy()
+        env.pop("HF_HUB_ENABLE_HF_TRANSFER", None)
 
-        for idx, sibling in enumerate(siblings, 1):
-            # ── Cancel gate ────────────────────────────────────────
-            if self._cancel_event.is_set():
-                raise DownloadCancelled(
-                    f"Download of {model_id} stopped at file {idx}/{total_files}"
+        # ── Launch ─────────────────────────────────────────────────
+        self._dl_process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            start_new_session=True,
+        )
+
+        start_time = time.monotonic()
+
+        try:
+            fd = self._dl_process.stderr.fileno()
+            fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+            fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+
+            buf = ""
+
+            while self._dl_process.poll() is None:
+                # ── Cancel gate ────────────────────────────────────
+                if self._cancel_event.is_set():
+                    self._kill_dl_process()
+                    raise DownloadCancelled(
+                        f"Download of {model_id} cancelled"
+                    )
+
+                # ── Read stderr for tqdm progress ──────────────────
+                try:
+                    raw = os.read(fd, 8192)
+                    if raw:
+                        buf += raw.decode("utf-8", errors="replace")
+                        parts = re.split(r"[\r\n]+", buf)
+                        buf = parts[-1]
+                        for part in parts[:-1]:
+                            self._parse_cli_progress(
+                                part, files_info, total_bytes,
+                                total_files, start_time, on_progress,
+                            )
+                except (OSError, BlockingIOError):
+                    pass
+
+                time.sleep(0.15)
+
+            # ── Process exited ─────────────────────────────────────
+            retcode = self._dl_process.returncode
+
+            if retcode != 0:
+                if self._cancel_event.is_set():
+                    raise DownloadCancelled(
+                        f"Download of {model_id} cancelled"
+                    )
+                err = ""
+                try:
+                    rest = self._dl_process.stderr.read()
+                    if rest:
+                        err = rest.decode("utf-8", errors="replace")
+                except Exception:
+                    pass
+                raise RuntimeError(
+                    f"huggingface-cli download failed (exit {retcode}):\n{err}"
                 )
 
-            fname = sibling.rfilename
-            fsize = getattr(sibling, "size", 0) or 0
-            tracker.file_start(fname, idx)
-
-            # Notify "downloading" status
-            if on_progress:
-                bd = tracker.bytes_done
-                on_progress(
-                    fname, idx, total_files, bd, total_bytes,
-                    "downloading", tracker.speed,
-                )
-
-            # ── Monkey-patch tqdm to capture byte-level progress ──
-            import tqdm as _tqdm_mod
-            _orig_init = _tqdm_mod.tqdm.__init__
-            _orig_update = _tqdm_mod.tqdm.update
-            _this_tracker = tracker  # closure capture
-
-            def _patched_init(self_bar, *a: Any, **kw: Any) -> None:
-                _orig_init(self_bar, *a, **kw)
-                self_bar._llm_patched = True
-
-            def _patched_update(self_bar, n: int = 1) -> None:
-                _orig_update(self_bar, n)
-                if getattr(self_bar, "_llm_patched", False):
-                    _this_tracker.tqdm_update(n)
-
-            _tqdm_mod.tqdm.__init__ = _patched_init  # type: ignore[assignment]
-            _tqdm_mod.tqdm.update = _patched_update  # type: ignore[assignment]
-
+            # stdout = local path printed by huggingface-cli
+            path = ""
             try:
-                last_path = hf_hub_download(
-                    model_id,
-                    filename=fname,
-                    cache_dir=str(self.hub_cache),
+                path = (
+                    self._dl_process.stdout
+                    .read()
+                    .decode("utf-8", errors="replace")
+                    .strip()
                 )
-            finally:
-                # Always restore tqdm
-                _tqdm_mod.tqdm.__init__ = _orig_init  # type: ignore[assignment]
-                _tqdm_mod.tqdm.update = _orig_update  # type: ignore[assignment]
+            except Exception:
+                pass
 
-            tracker.file_done(fname, fsize)
-
-            # Notify "done" status
+            # Notify all files done
             if on_progress:
-                bd = tracker.bytes_done
-                on_progress(
-                    fname, idx, total_files, bd, total_bytes,
-                    "done", tracker.speed,
-                )
+                for idx, f in enumerate(files_info, 1):
+                    on_progress(
+                        f["name"], idx, total_files,
+                        total_bytes, total_bytes, "done", 0.0,
+                    )
 
-        # Return the snapshot directory (parent of files)
-        return str(Path(last_path).parent) if last_path else ""
+            return path or str(self.hub_cache)
+
+        finally:
+            self._dl_process = None
+
+    # ── Subprocess helpers ─────────────────────────────────────────────
+
+    def _kill_dl_process(self) -> None:
+        """Send SIGTERM (then SIGKILL) to the download process group."""
+        proc = self._dl_process
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except (OSError, ProcessLookupError):
+            pass
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+
+    @staticmethod
+    def _parse_cli_progress(
+        line: str,
+        files_info: List[Dict[str, Any]],
+        total_bytes: int,
+        total_files: int,
+        start_time: float,
+        on_progress: Optional[Callable],
+    ) -> None:
+        """Extract progress percentage from tqdm CLI output."""
+        if not on_progress or "%" not in line:
+            return
+        m = re.search(r"(\d+)%\|", line)
+        if not m:
+            return
+        pct = int(m.group(1))
+        bytes_done = int(total_bytes * pct / 100)
+        elapsed = time.monotonic() - start_time
+        speed = bytes_done / elapsed if elapsed > 1.0 else 0.0
+
+        # Try to extract filename from "filename:  XX%|…"
+        fname = files_info[0]["name"] if files_info else ""
+        fn_m = re.match(r"^(.*?):\s+\d+%", line)
+        if fn_m:
+            raw = fn_m.group(1).strip()
+            for f in files_info:
+                if f["name"] == raw or f["name"].endswith(raw):
+                    fname = f["name"]
+                    break
+
+        on_progress(
+            fname, 1, total_files, bytes_done, total_bytes,
+            "downloading", speed,
+        )
 
     def cancel_download(self) -> None:
-        """Signal the running download to stop after the current file."""
+        """Terminate the download subprocess immediately."""
         self._cancel_event.set()
+        self._kill_dl_process()
 
     @property
     def is_download_cancelled(self) -> bool:

@@ -69,8 +69,14 @@ class DaemonClient:
     def stop_server(self) -> dict:
         return self.send_command("stop_server")
 
-    def load_model(self, model_id: str) -> dict:
-        return self.send_command("load_model", model_id=model_id)
+    def load_model(self, model_id: str, backend: str | None = None) -> dict:
+        kwargs: dict = {"model_id": model_id}
+        if backend and backend != "auto":
+            kwargs["backend"] = backend
+        return self.send_command("load_model", **kwargs)
+
+    def switch_backend(self, backend: str) -> dict:
+        return self.send_command("switch_backend", backend=backend)
 
     def unload_model(self) -> dict:
         return self.send_command("unload_model")
@@ -81,8 +87,18 @@ class DaemonClient:
     def search_models(self, query: str) -> list:
         return self.send_command("search_models", query=query).get("data", [])
 
-    def download_model(self, model_id: str) -> dict:
-        return self.send_command("download_model", model_id=model_id)
+    def list_repo_files(self, model_id: str) -> list:
+        return self.send_command("list_repo_files", model_id=model_id).get(
+            "data", []
+        )
+
+    def download_model(
+        self, model_id: str, filenames: list[str] | None = None
+    ) -> dict:
+        kwargs: dict = {"model_id": model_id}
+        if filenames:
+            kwargs["filenames"] = filenames
+        return self.send_command("download_model", **kwargs)
 
     def download_status(self) -> dict:
         return self.send_command("download_status").get("data", {})

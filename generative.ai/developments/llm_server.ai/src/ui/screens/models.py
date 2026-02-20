@@ -13,6 +13,7 @@ from textual.widgets import (
     Input,
     DataTable,
     ProgressBar,
+    Select,
 )
 
 from src.daemon.client import DaemonDisconnected
@@ -96,6 +97,24 @@ class ModelsScreen(Container):
         height: 3;
         margin: 0;
     }
+
+    /* ── Backend selector ── */
+    #backend-row {
+        height: 3;
+        margin: 0 0 0 0;
+        align: left middle;
+    }
+    #backend-select {
+        width: 28;
+    }
+    #backend-label {
+        width: auto;
+        margin: 0 1 0 0;
+        color: #c0caf5;
+    }
+    #btn-switch-bk {
+        width: 26;
+    }
     """
 
     def compose(self) -> ComposeResult:
@@ -130,12 +149,25 @@ class ModelsScreen(Container):
             )
             with Horizontal(id="dl-ctrl-row"):
                 yield Button("⏹  Stop", id="btn-stop-dl", variant="error")
-                yield Button("▶  Resume", id="btn-resume-dl", variant="warning")
 
         # ── Downloaded models ──────────────────────────────────────
         with Container(classes="model-section"):
             yield Static("📦  [b]Downloaded Models[/b]", markup=True)
             yield DataTable(id="downloaded-models")
+
+            with Horizontal(id="backend-row"):
+                yield Static("Engine:", id="backend-label")
+                yield Select(
+                    [("🔄 Auto", "auto"),
+                     ("🔧 Transformers", "transformers"),
+                     ("🦙 llama.cpp", "llama.cpp")],
+                    value="auto",
+                    id="backend-select",
+                    allow_blank=False,
+                )
+                yield Button(
+                    "⇄  Switch Backend", id="btn-switch-bk", variant="default"
+                )
 
             with Horizontal(classes="model-btn-row"):
                 yield Button("🔄  Load", id="btn-load", variant="success")
@@ -158,11 +190,8 @@ class ModelsScreen(Container):
 
         # Downloaded table
         dtbl = self.query_one("#downloaded-models", DataTable)
-        dtbl.add_columns("Model ID", "Size", "Files", "Status")
+        dtbl.add_columns("Model ID", "Format", "Size", "Files", "Status")
         dtbl.cursor_type = "row"
-
-        # Resume hidden at first
-        self.query_one("#btn-resume-dl", Button).display = False
 
         self._downloading_model_id: str | None = None
         self._file_keys: list[str] = []
@@ -179,13 +208,21 @@ class ModelsScreen(Container):
         except DaemonDisconnected:
             return
         for m in models:
-            status = (
-                "[green]● Loaded[/green]"
-                if m.get("is_loaded")
-                else "[dim]available[/dim]"
-            )
+            fmt = m.get("format", "?")
+            fmt_label = {
+                "gguf": "[bold cyan]GGUF[/bold cyan]",
+                "safetensors": "[bold green]SafeT[/bold green]",
+                "pytorch": "[yellow]PyTorch[/yellow]",
+            }.get(fmt, fmt)
+            if m.get("is_loaded"):
+                backend = m.get("backend", "")
+                bk = f" ({backend})" if backend else ""
+                status = f"[green]● Loaded{bk}[/green]"
+            else:
+                status = "[dim]available[/dim]"
             dtbl.add_row(
                 m["repo_id"],
+                fmt_label,
                 m.get("size_str", "?"),
                 str(m.get("nb_files", "?")),
                 status,
@@ -203,10 +240,10 @@ class ModelsScreen(Container):
             self._download_selected()
         elif bid == "btn-stop-dl":
             self._stop_download()
-        elif bid == "btn-resume-dl":
-            self._resume_download()
         elif bid == "btn-load":
             self._load_selected()
+        elif bid == "btn-switch-bk":
+            self._switch_backend()
         elif bid == "btn-unload":
             self._unload_model()
         elif bid == "btn-delete":
@@ -254,18 +291,76 @@ class ModelsScreen(Container):
         if tbl.cursor_row is not None and tbl.row_count > 0:
             row_key, _ = tbl.coordinate_to_cell_key(tbl.cursor_coordinate)
             model_id = str(row_key.value)
-            self._start_download(model_id)
+            self._maybe_pick_files(model_id)
         else:
             self.app.notify(
                 "Select a model from search results first",
                 severity="warning",
             )
 
-    def _start_download(self, model_id: str) -> None:
+    @work(thread=True, exclusive=True, group="file-pick")
+    def _maybe_pick_files(self, model_id: str) -> None:
+        """If the repo has multiple GGUF files, show a picker dialog."""
+        client = self.app.client  # type: ignore[attr-defined]
+        status = self.query_one("#dl-status", Static)
+        self.app.call_from_thread(
+            status.update, f"Fetching file list for [b]{model_id}[/b]…"
+        )
+        try:
+            files = client.list_repo_files(model_id)
+        except DaemonDisconnected:
+            self.app.call_from_thread(
+                status.update, "[red]Daemon offline[/red]"
+            )
+            return
+        except Exception as exc:
+            self.app.call_from_thread(
+                status.update, f"[red]Error: {exc}[/red]"
+            )
+            return
+
+        gguf_files = [f for f in files if f["name"].endswith(".gguf")]
+
+        if len(gguf_files) > 1:
+            # Multiple GGUF variants → show picker
+            self.app.call_from_thread(status.update, "")
+            self.app.call_from_thread(
+                self._show_file_picker, model_id, gguf_files
+            )
+        else:
+            # Single GGUF or non-GGUF repo → download everything
+            self.app.call_from_thread(status.update, "")
+            self.app.call_from_thread(self._start_download, model_id)
+
+    def _show_file_picker(
+        self, model_id: str, files: list[dict]
+    ) -> None:
+        from src.ui.dialogs import FilePickerDialog
+
+        def on_result(result: list[str] | str | None) -> None:
+            if result == "__cancel__":
+                return  # user cancelled
+            if result is None:
+                # "Download All" — download everything
+                self._start_download(model_id)
+            else:
+                # Download only the selected files
+                self._start_download(model_id, filenames=result)
+
+        self.app.push_screen(
+            FilePickerDialog(model_id, files, title="📂  Select GGUF variant"),
+            on_result,
+        )
+
+    def _start_download(
+        self,
+        model_id: str,
+        filenames: list[str] | None = None,
+    ) -> None:
         """Tell daemon to start downloading, then begin polling."""
         client = self.app.client  # type: ignore[attr-defined]
         try:
-            result = client.download_model(model_id)
+            result = client.download_model(model_id, filenames=filenames)
             if not result.get("ok"):
                 self.app.notify(
                     result.get("error", "Download failed"), severity="error"
@@ -287,7 +382,6 @@ class ModelsScreen(Container):
         self._file_keys = []
         self.query_one("#dl-progress", ProgressBar).update(total=100, progress=0)
         self.query_one("#btn-stop-dl", Button).display = True
-        self.query_one("#btn-resume-dl", Button).display = False
         self.query_one("#dl-status", Static).update("")
         # Start polling loop
         self._poll_download_loop()
@@ -342,64 +436,33 @@ class ModelsScreen(Container):
 
             # Terminal states
             if phase == "completed":
-                self.app.call_from_thread(
-                    self.query_one("#dl-progress", ProgressBar).update,
-                    total=100,
-                    progress=100,
-                )
-                self.app.call_from_thread(
-                    self.query_one("#dl-header", Static).update,
-                    f"[green]✓  Download complete — {self._downloading_model_id}[/green]",
-                )
-                self.app.call_from_thread(
-                    setattr,
-                    self.query_one("#btn-stop-dl", Button),
-                    "display",
-                    False,
-                )
+                mid = self._downloading_model_id
                 self.app.call_from_thread(self._refresh_downloaded)
+                self.app.call_from_thread(self._clean_dl_panel)
                 self.app.call_from_thread(
                     self.app.notify,
-                    f"Model {self._downloading_model_id} downloaded ✓",
+                    f"Model {mid} downloaded ✓",
                 )
                 self._downloading_model_id = None
                 break
 
             elif phase == "cancelled":
-                self.app.call_from_thread(
-                    self.query_one("#dl-header", Static).update,
-                    f"[yellow]⏸  Paused:[/yellow] {self._downloading_model_id}",
-                )
-                self.app.call_from_thread(
-                    setattr,
-                    self.query_one("#btn-stop-dl", Button),
-                    "display",
-                    False,
-                )
-                self.app.call_from_thread(
-                    setattr,
-                    self.query_one("#btn-resume-dl", Button),
-                    "display",
-                    True,
-                )
+                self.app.call_from_thread(self._clean_dl_panel)
                 self.app.call_from_thread(
                     self.app.notify,
-                    "Download stopped — press Resume to continue",
+                    "Download stopped ✓",
                     severity="warning",
                 )
+                self._downloading_model_id = None
                 break
 
             elif phase == "error":
                 err = st.get("error", "Unknown error")
+                self.app.call_from_thread(self._clean_dl_panel)
                 self.app.call_from_thread(
-                    self.query_one("#dl-header", Static).update,
-                    f"[red]✗  Error:[/red] {err}",
-                )
-                self.app.call_from_thread(
-                    setattr,
-                    self.query_one("#btn-stop-dl", Button),
-                    "display",
-                    False,
+                    self.app.notify,
+                    f"Download error: {err}",
+                    severity="error",
                 )
                 self._downloading_model_id = None
                 break
@@ -453,16 +516,25 @@ class ModelsScreen(Container):
     def _stop_download(self) -> None:
         try:
             self.app.client.cancel_download()  # type: ignore[attr-defined]
-            self.app.notify("Stopping after current file…")  # type: ignore[attr-defined]
         except DaemonDisconnected:
             self.app.notify("Daemon offline", severity="error")  # type: ignore[attr-defined]
+            return
+        # Immediately clean the panel for snappy UX;
+        # the poll loop will also break on "cancelled" phase.
+        self._clean_dl_panel()
+        self._downloading_model_id = None
+        self.app.notify("Download stopped ✓", severity="warning")  # type: ignore[attr-defined]
 
-    def _resume_download(self) -> None:
-        """Resume = re-run download; already-fetched files are auto-skipped."""
-        if self._downloading_model_id:
-            mid = self._downloading_model_id
-            self.app.notify(f"Resuming {mid}…")  # type: ignore[attr-defined]
-            self._start_download(mid)
+    def _clean_dl_panel(self) -> None:
+        """Hide the download panel and reset all its widgets."""
+        panel = self.query_one("#dl-panel", Container)
+        panel.display = False
+        self.query_one("#dl-header", Static).update("")
+        self.query_one("#dl-overall-label", Static).update("")
+        self.query_one("#dl-file-table", DataTable).clear()
+        self.query_one("#dl-progress", ProgressBar).update(total=100, progress=0)
+        self.query_one("#btn-stop-dl", Button).display = False
+        self._file_keys = []
 
     def _check_existing_download(self) -> None:
         """If daemon has an active download, show the panel and start polling."""
@@ -477,7 +549,6 @@ class ModelsScreen(Container):
                     f"⬇  Downloading [b]{model_id}[/b]"
                 )
                 self.query_one("#btn-stop-dl", Button).display = True
-                self.query_one("#btn-resume-dl", Button).display = False
                 self._poll_download_loop()
         except DaemonDisconnected:
             pass
@@ -488,31 +559,80 @@ class ModelsScreen(Container):
         if dtbl.cursor_row is not None and dtbl.row_count > 0:
             row_key, _ = dtbl.coordinate_to_cell_key(dtbl.cursor_coordinate)
             model_id = str(row_key.value)
-            self._do_load(model_id)
+            backend = self.query_one("#backend-select", Select).value
+            self._do_load(model_id, backend=str(backend))
         else:
             self.app.notify(  # type: ignore[attr-defined]
                 "Select a downloaded model first", severity="warning"
             )
 
     @work(thread=True, exclusive=True, group="load")
-    def _do_load(self, model_id: str) -> None:
+    def _do_load(self, model_id: str, backend: str = "auto") -> None:
         status = self.query_one("#dl-status", Static)
-        self.app.call_from_thread(status.update, f"Loading [b]{model_id}[/b]…")
+        bk_label = f" [{backend}]" if backend != "auto" else ""
+        self.app.call_from_thread(
+            status.update, f"Loading [b]{model_id}[/b]{bk_label}…"
+        )
         try:
-            result = self.app.client.load_model(model_id)  # type: ignore[attr-defined]
+            result = self.app.client.load_model(  # type: ignore[attr-defined]
+                model_id, backend=backend
+            )
             if result.get("ok"):
+                actual = result.get("data", {}).get("backend", backend)
                 self.app.call_from_thread(
-                    status.update, f"[green]✓ Model {model_id} loaded[/green]"
+                    status.update,
+                    f"[green]✓ {model_id} loaded ({actual})[/green]",
                 )
                 self.app.call_from_thread(self._refresh_downloaded)
                 self.app.call_from_thread(self.app.update_sidebar_status)
                 self.app.call_from_thread(
-                    self.app.notify, f"Model loaded: {model_id}"
+                    self.app.notify, f"Model loaded: {model_id} ({actual})"
                 )
             else:
                 err = result.get("error", "Failed")
                 self.app.call_from_thread(
                     status.update, f"[red]Load error: {err}[/red]"
+                )
+        except DaemonDisconnected:
+            self.app.call_from_thread(status.update, "[red]Daemon offline[/red]")
+
+    def _switch_backend(self) -> None:
+        """Switch the currently loaded model to the selected backend."""
+        backend = str(self.query_one("#backend-select", Select).value)
+        if backend == "auto":
+            self.app.notify(  # type: ignore[attr-defined]
+                "Select a specific backend (Transformers or llama.cpp)",
+                severity="warning",
+            )
+            return
+        self._do_switch(backend)
+
+    @work(thread=True, exclusive=True, group="load")
+    def _do_switch(self, backend: str) -> None:
+        status = self.query_one("#dl-status", Static)
+        self.app.call_from_thread(
+            status.update, f"Switching to [b]{backend}[/b]…"
+        )
+        try:
+            result = self.app.client.switch_backend(backend)  # type: ignore[attr-defined]
+            if result.get("ok"):
+                data = result.get("data", {})
+                mid = data.get("model_id", "?")
+                bk = data.get("backend", backend)
+                self.app.call_from_thread(
+                    status.update,
+                    f"[green]✓ {mid} reloaded ({bk})[/green]",
+                )
+                self.app.call_from_thread(self._refresh_downloaded)
+                self.app.call_from_thread(self.app.update_sidebar_status)
+                self.app.call_from_thread(
+                    self.app.notify,
+                    f"Backend switched: {mid} → {bk}",
+                )
+            else:
+                err = result.get("error", "Switch failed")
+                self.app.call_from_thread(
+                    status.update, f"[red]Switch error: {err}[/red]"
                 )
         except DaemonDisconnected:
             self.app.call_from_thread(status.update, "[red]Daemon offline[/red]")

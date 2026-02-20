@@ -183,6 +183,7 @@ class LLMDaemon:
                 "server_port": self.config.port,
                 "model_loaded": self.engine.is_loaded,
                 "model_id": self.engine.model_id,
+                "active_backend": self.engine.active_backend,
                 "loading_model": self._loading_model,
             },
         }
@@ -218,16 +219,50 @@ class LLMDaemon:
         model_id = args.get("model_id", "")
         if not model_id:
             return {"ok": False, "error": "No model_id provided"}
+        backend = args.get("backend")  # None / "auto" / "transformers" / "llama.cpp"
         self._loading_model = model_id
         try:
             with self._model_lock:
-                self.engine.load_model(model_id)
+                self.engine.load_model(model_id, force_backend=backend)
                 self.config.active_model = model_id
                 self.config.save()
-            log.info("Model loaded: %s", model_id)
-            return {"ok": True}
+            log.info(
+                "Model loaded: %s (backend=%s)",
+                model_id,
+                self.engine.active_backend,
+            )
+            return {
+                "ok": True,
+                "data": {"backend": self.engine.active_backend},
+            }
         except Exception as exc:
             log.exception("Failed to load model %s", model_id)
+            return {"ok": False, "error": str(exc)}
+        finally:
+            self._loading_model = None
+
+    def _cmd_switch_backend(self, args: dict) -> dict:
+        backend = args.get("backend", "")
+        if backend not in ("transformers", "llama.cpp"):
+            return {"ok": False, "error": f"Invalid backend: {backend!r}"}
+        if not self.engine.is_loaded:
+            return {"ok": False, "error": "No model loaded"}
+        model_id = self.engine.model_id
+        self._loading_model = model_id
+        try:
+            with self._model_lock:
+                self.engine.reload_with_backend(backend)
+            log.info(
+                "Backend switched to %s for %s",
+                self.engine.active_backend,
+                model_id,
+            )
+            return {
+                "ok": True,
+                "data": {"backend": self.engine.active_backend, "model_id": model_id},
+            }
+        except Exception as exc:
+            log.exception("Failed to switch backend to %s", backend)
             return {"ok": False, "error": str(exc)}
         finally:
             self._loading_model = None
@@ -255,6 +290,10 @@ class LLMDaemon:
         models = self.mm.list_downloaded_models()
         for m in models:
             m["is_loaded"] = self.engine.model_id == m["repo_id"]
+            if m["is_loaded"] and self.engine.active_backend:
+                m["backend"] = self.engine.active_backend
+            else:
+                m["backend"] = None
             if "last_modified" in m:
                 m["last_modified"] = str(m["last_modified"])
         return {"ok": True, "data": models}
@@ -285,13 +324,27 @@ class LLMDaemon:
         return {"ok": True, "data": self.mm.total_cache_size()}
 
     # ── Download (async — runs in background) ──────────────────────
+    def _cmd_list_repo_files(self, args: dict) -> dict:
+        model_id = args.get("model_id", "")
+        if not model_id:
+            return {"ok": False, "error": "No model_id provided"}
+        try:
+            files = self.mm.list_repo_files(model_id)
+            return {"ok": True, "data": files}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
     def _cmd_download_model(self, args: dict) -> dict:
         model_id = args.get("model_id", "")
         if not model_id:
             return {"ok": False, "error": "No model_id provided"}
+        filenames = args.get("filenames")  # None = all files
+        # If a previous download thread is still alive (e.g. finishing
+        # the current file after cancel), signal it to stop – the new
+        # download thread will wait for it before proceeding.
         if self._dl_thread and self._dl_thread.is_alive():
-            return {"ok": False, "error": "A download is already in progress"}
-        self._start_download(model_id)
+            self.mm.cancel_download()
+        self._start_download(model_id, filenames=filenames)
         return {"ok": True}
 
     def _cmd_download_status(self, _args: dict) -> dict:
@@ -612,7 +665,11 @@ class LLMDaemon:
             "error": None,
         }
 
-    def _start_download(self, model_id: str) -> None:
+    def _start_download(
+        self, model_id: str, filenames: list[str] | None = None
+    ) -> None:
+        old_thread = self._dl_thread          # keep ref so new thread can join
+
         with self._dl_lock:
             self._dl_state = self._empty_dl_state()
             self._dl_state["active"] = True
@@ -620,12 +677,26 @@ class LLMDaemon:
             self._dl_state["phase"] = "preparing"
 
         self._dl_thread = threading.Thread(
-            target=self._run_download, args=(model_id,), daemon=True
+            target=self._run_download,
+            args=(model_id, old_thread, filenames),
+            daemon=True,
         )
         self._dl_thread.start()
 
-    def _run_download(self, model_id: str) -> None:
+    def _run_download(
+        self,
+        model_id: str,
+        old_thread: threading.Thread | None = None,
+        filenames: list[str] | None = None,
+    ) -> None:
         from src.llms.model_manager import DownloadCancelled
+
+        # If a previous download thread is still running (finishing its
+        # current file after a cancel), wait for it so we don't have two
+        # threads calling hf_hub_download concurrently.
+        if old_thread is not None and old_thread.is_alive():
+            log.info("Waiting for previous download thread to finish …")
+            old_thread.join(timeout=60)
 
         _last_update = [0.0]  # mutable for closure
 
@@ -678,7 +749,10 @@ class LLMDaemon:
         try:
             log.info("Download started: %s", model_id)
             self.mm.download_model_with_progress(
-                model_id, on_progress=on_progress, on_file_list=on_file_list
+                model_id,
+                on_progress=on_progress,
+                on_file_list=on_file_list,
+                filenames=filenames,
             )
             with self._dl_lock:
                 self._dl_state["active"] = False

@@ -7,3 +7,5 @@ huggingface-hub>=0.26.0
 accelerate>=0.35.0
 rich>=13.9.0
 pydantic>=2.9.0
+# llama-cpp-python is installed separately (needs CUDA build)
+# llama-cpp-python>=0.3.0

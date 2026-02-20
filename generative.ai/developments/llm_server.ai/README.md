@@ -115,3 +115,45 @@ All state is stored under `~/.config/llm_server_ai/`:
 | `daemon.log` | Daemon log output |
 
 Model weights are cached in the Hugging Face hub cache (`~/.cache/huggingface/hub/` by default, configurable in Settings).
+
+## Docker
+
+### Build
+
+```bash
+docker build -t llm-server-ai .
+```
+
+### Run (TUI — interactive)
+
+```bash
+docker run --rm -it \
+  --gpus all \
+  --network host \
+  -v /path/to/models:/root/.cache/huggingface/hub \
+  -v /path/to/config:/root/.config/llm_server_ai \
+  -e HF_TOKEN=hf_xxxxx \
+  llm-server-ai
+```
+
+### Run (Daemon — headless)
+
+```bash
+docker run -d \
+  --name llm-server-ai \
+  --gpus all \
+  --network host \
+  --restart unless-stopped \
+  -v /path/to/models:/root/.cache/huggingface/hub \
+  -v /path/to/config:/root/.config/llm_server_ai \
+  -e HF_TOKEN=hf_xxxxx \
+  llm-server-ai python run.py --daemon
+```
+
+| Flag | Purpose |
+|------|---------|
+| `--gpus all` | NVIDIA GPU access (requires [nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)) |
+| `--network host` | API server (`0.0.0.0:8000`) accessible from host |
+| `-v .../models:...` | Model weights persist on host (reusable across containers) |
+| `-v .../config:...` | DB + config persist on host |
+| `-e HF_TOKEN` | HuggingFace token for gated model downloads (optional) |
