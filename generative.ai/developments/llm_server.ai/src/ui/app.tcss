@@ -1,0 +1,192 @@
+/* ═══════════════════════════════════════════════════════════════════
+   LLM Server.AI — Textual CSS Theme (Tokyo Night inspired)
+   ═══════════════════════════════════════════════════════════════════ */
+
+/* ── Global ────────────────────────────────────────────────────────── */
+
+Screen {
+    background: #1a1b26;
+}
+
+Header {
+    background: #7aa2f7;
+    color: #1a1b26;
+}
+
+Footer {
+    background: #24283b;
+}
+
+/* ── Main layout ───────────────────────────────────────────────────── */
+
+#app-grid {
+    layout: horizontal;
+    height: 1fr;
+}
+
+/* ── Sidebar ───────────────────────────────────────────────────────── */
+
+#sidebar {
+    width: 30;
+    background: #24283b;
+    border-right: solid #414868;
+    padding: 1 0;
+    overflow-y: auto;
+}
+
+.nav-title {
+    text-align: center;
+    text-style: bold;
+    color: #7aa2f7;
+    padding: 1 1 0 1;
+}
+
+.nav-subtitle {
+    text-align: center;
+    color: #565f89;
+    padding: 0 1 1 1;
+}
+
+.nav-sep {
+    color: #414868;
+    text-align: center;
+    margin: 1 1;
+}
+
+.nav-btn {
+    width: 100%;
+    margin: 0 1;
+    height: 3;
+    background: #24283b;
+    color: #c0caf5;
+    border: none;
+    text-style: none;
+}
+
+.nav-btn:hover {
+    background: #414868;
+    text-style: none;
+}
+
+.nav-btn:focus {
+    background: #414868;
+    color: #c0caf5;
+    text-style: none;
+}
+
+.nav-btn.-active {
+    background: #7aa2f7;
+    color: #1a1b26;
+    text-style: bold;
+}
+
+.nav-btn.-active:focus {
+    background: #7aa2f7;
+    color: #1a1b26;
+    text-style: bold;
+}
+
+.nav-btn > .label {
+    text-style: none;
+}
+
+.nav-status {
+    margin: 1 1 0 1;
+    padding: 1;
+    background: #1a1b26;
+    border: solid #414868;
+    height: auto;
+}
+
+/* ── Content area ──────────────────────────────────────────────────── */
+
+#main-content {
+    width: 1fr;
+    background: #1a1b26;
+    padding: 0 0 0 1;
+}
+
+/* ── Panel titles ──────────────────────────────────────────────────── */
+
+.panel-title {
+    text-style: bold;
+    color: #c0caf5;
+    text-align: center;
+    padding: 1;
+    background: #24283b;
+    margin: 0 0 1 0;
+    border: solid #414868;
+}
+
+/* ── Buttons ───────────────────────────────────────────────────────── */
+
+Button {
+    margin: 0 1 0 0;
+}
+
+.btn-row {
+    height: 3;
+    margin: 1 0 0 0;
+}
+
+/* ── DataTable ─────────────────────────────────────────────────────── */
+
+DataTable {
+    height: auto;
+    max-height: 18;
+    background: #1a1b26;
+    scrollbar-background: #24283b;
+    scrollbar-color: #414868;
+}
+
+DataTable > .datatable--header {
+    background: #414868;
+    color: #c0caf5;
+    text-style: bold;
+}
+
+DataTable > .datatable--cursor {
+    background: #364a82;
+    color: #c0caf5;
+}
+
+/* ── Input / TextArea ──────────────────────────────────────────────── */
+
+Input {
+    background: #1a1b26;
+    border: solid #414868;
+    color: #c0caf5;
+}
+
+Input:focus {
+    border: solid #7aa2f7;
+}
+
+TextArea {
+    background: #1a1b26;
+    border: solid #414868;
+}
+
+TextArea:focus {
+    border: solid #7aa2f7;
+}
+
+/* ── Switch ────────────────────────────────────────────────────────── */
+
+Switch {
+    background: #414868;
+}
+
+/* ── RichLog ───────────────────────────────────────────────────────── */
+
+RichLog {
+    background: #1a1b26;
+    border: solid #414868;
+    padding: 1;
+}
+
+/* ── ContentSwitcher ───────────────────────────────────────────────── */
+
+ContentSwitcher {
+    height: 1fr;
+}

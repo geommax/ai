@@ -1,0 +1,9 @@
+textual>=0.85.0
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+transformers>=4.46.0
+torch>=2.1.0
+huggingface-hub>=0.26.0
+accelerate>=0.35.0
+rich>=13.9.0
+pydantic>=2.9.0
