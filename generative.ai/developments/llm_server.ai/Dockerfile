@@ -21,7 +21,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # ── Install llama-cpp-python with CUDA (needs build tools) ─────────────
 ENV CMAKE_ARGS="-DGGML_CUDA=on"
 ENV CUDACXX=/usr/local/cuda/bin/nvcc
-RUN pip install --no-cache-dir llama-cpp-python==0.3.16
+RUN pip install --no-cache-dir cmake ninja scikit-build-core \
+    && pip install --no-cache-dir --verbose llama-cpp-python==0.3.16
 
 # ═══════════════════════════════════════════════════════════════════════
 #  Runtime stage — smaller image

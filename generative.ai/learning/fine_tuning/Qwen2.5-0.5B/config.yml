@@ -1,0 +1,63 @@
+# ============================================================
+# Full Fine-Tuning Config: Qwen2.5-0.5B
+# GPU: RTX 3050 12GB
+# Expected VRAM: ~5-6 GB
+# ============================================================
+
+# Model
+base_model: Qwen/Qwen2.5-0.5B
+model_type: AutoModelForCausalLM
+tokenizer_type: AutoTokenizer
+trust_remote_code: true
+
+# Tokenizer — pad_token setting
+special_tokens:
+  pad_token: "<|endoftext|>"
+
+# Full Fine-Tuning
+load_in_8bit: false
+load_in_4bit: false
+
+# Dataset
+datasets:
+  - path: /workspace/data/Qwen2.5-0.5B/train.jsonl
+    type: alpaca
+
+dataset_prepared_path: /workspace/data/Qwen2.5-0.5B/prepared
+val_set_size: 0.1
+
+# Training
+output_dir: /workspace/data/Qwen2.5-0.5B/output
+
+sequence_len: 1024
+num_epochs: 3
+micro_batch_size: 1
+gradient_accumulation_steps: 8
+eval_batch_size: 1
+
+# Optimizer
+learning_rate: 2e-5
+optimizer: adamw_torch
+lr_scheduler: cosine
+weight_decay: 0.01
+warmup_ratio: 0.1
+
+# Precision
+bf16: auto
+tf32: true
+
+# Memory Optimization
+gradient_checkpointing: true
+flash_attention: true
+sample_packing: true
+pad_to_sequence_len: true
+
+# Logging
+logging_steps: 1
+eval_steps: 10
+save_steps: 50
+save_total_limit: 2
+
+# Misc
+seed: 42
+strict: false

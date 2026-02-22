@@ -1,0 +1,62 @@
+# ============================================================
+# Full Fine-Tuning Config: SmolLM2-135M
+# GPU: RTX 3050 12GB — Test Run
+# Expected VRAM: ~2-3 GB
+# ============================================================
+
+# Model
+base_model: HuggingFaceTB/SmolLM2-135M
+model_type: LlamaForCausalLM
+tokenizer_type: AutoTokenizer
+trust_remote_code: true
+
+# Tokenizer — pad_token မရှိတဲ့ model တွေအတွက် ထည့်ပေးရပါမယ်
+special_tokens:
+  pad_token: "<|endoftext|>"
+
+# Full Fine-Tuning (no adapter)
+# adapter:  ← comment out or remove = full fine-tuning
+load_in_8bit: false
+load_in_4bit: false
+
+# Dataset
+datasets:
+  - path: /workspace/data/SmolLM2-135M/train.jsonl
+    type: alpaca
+
+dataset_prepared_path: /workspace/data/SmolLM2-135M/prepared
+val_set_size: 0.1
+
+# Training
+output_dir: /workspace/data/SmolLM2-135M/output
+
+sequence_len: 512
+num_epochs: 3
+micro_batch_size: 2
+gradient_accumulation_steps: 4
+eval_batch_size: 1
+
+# Optimizer
+learning_rate: 2e-5
+optimizer: adamw_torch
+lr_scheduler: cosine
+weight_decay: 0.01
+warmup_ratio: 0.1
+
+# Precision — RTX 3050 supports bf16
+bf16: auto
+tf32: true
+
+# Memory Optimization
+gradient_checkpointing: true
+flash_attention: true
+
+# Logging
+logging_steps: 1
+eval_steps: 5
+save_steps: 50
+save_total_limit: 2
+
+# Misc
+seed: 42
+strict: false
