@@ -130,10 +130,17 @@ docker build -t llm-server-ai .
 docker run --rm -it \
   --gpus all \
   --network host \
+<<<<<<< HEAD
   -v /path/to/models:/root/.cache/huggingface/hub \
   -v /path/to/config:/root/.config/llm_server_ai \
   -e HF_TOKEN=hf_xxxxx \
   llm-server-ai
+=======
+  -v /home/mr_cobot/.cache/huggingface/hub:/root/.cache/huggingface/hub \
+  -v /home/mr_cobot/.config/llm_server_ai:/root/.config/llm_server_ai \
+  -e HF_TOKEN=hf_xxxxx \
+  llm-studio-gateway:latest 
+>>>>>>> 9f90254 (update)
 ```
 
 ### Run (Daemon — headless)
