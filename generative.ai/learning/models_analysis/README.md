@@ -279,7 +279,7 @@ graph TD
 
 ### 5.5 Vocab Size ကို ဘာကြောင့် ဂရုစိုက်ရလဲ?
 
-$$\text{Embedding Parameters} = \text{vocab\_size} \times \text{d\_model}$$
+$$\text{Embedding Parameters} = \text{vocab}\_{\text{size}} \times \text{d}\_{\text{model}}$$
 
 | Model | Vocab Size | Embed Dim | Embedding Params |
 |:------|:---------:|:---------:|:----------------:|
@@ -309,7 +309,7 @@ graph LR
 
 Embedding ဆိုတာ **lookup table** ပါပဲ:
 
-$$e = W_E[\text{token\_id}]$$
+$$e = W_E[\text{token}\_{\text{id}}]$$
 
 - $W_E \in \mathbb{R}^{V \times d}$ — Embedding matrix (V = vocab size, d = dimension)
 - Row တစ်ခုချင်းစီက token တစ်ခုကို represent လုပ်
@@ -383,11 +383,11 @@ $$\text{score} = QK^T$$
 
 **Step 3:** Scale လုပ် (dimension ကြီးရင် scores ကြီးလွန်းမှာစိုးလို့)
 
-$$\text{scaled\_score} = \frac{QK^T}{\sqrt{d_k}}$$
+$$\text{scaled}\_{\text{score}} = \frac{QK^T}{\sqrt{d_k}}$$
 
 **Step 4:** Softmax နဲ့ probabilities ပြောင်း (0 နဲ့ 1 ကြားထဲ, ပေါင်းလဒ် = 1)
 
-$$\text{attention\_weights} = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right)$$
+$$\text{attention}\_{\text{weights}} = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right)$$
 
 **Step 5:** Weights နဲ့ V ကို multiply (important values ကို ပိုယူ)
 
@@ -438,29 +438,28 @@ Model တွေအကြားမှာ attention mechanism ကွာခြာ�
 
 ```mermaid
 graph TB
-    subgraph MHA ["MHA — Multi-Head Attention<br/>(GPT-2, GPT-3)"]
+    subgraph MHA ["🔵 MHA — Multi-Head Attention · GPT-2, GPT-3"]
         direction LR
-        Q1["Q₁ - K₁ - V₁"]
-        Q2["Q₂ - K₂ - V₂"]
-        Q3["Q₃ - K₃ - V₃"]
-        Q4["Q₄ - K₄ - V₄"]
+        MQ1["Q₁"] --> MKV1["K₁ V₁"]
+        MQ2["Q₂"] --> MKV2["K₂ V₂"]
+        MQ3["Q₃"] --> MKV3["K₃ V₃"]
+        MQ4["Q₄"] --> MKV4["K₄ V₄"]
     end
 
-    subgraph MQA ["MQA — Multi-Query Attention<br/>(PaLM)"]
+    subgraph MQA ["🟠 MQA — Multi-Query Attention · PaLM"]
         direction LR
-        QA["Q₁"] --- KS["K<br/>(shared)"]
-        QB["Q₂"] --- KS
-        QC["Q₃"] --- KS
-        QD["Q₄"] --- KS
-        KS --- VS["V<br/>(shared)"]
+        AQ1["Q₁"] --> AKV["K · V\n(shared)"]
+        AQ2["Q₂"] --> AKV
+        AQ3["Q₃"] --> AKV
+        AQ4["Q₄"] --> AKV
     end
 
-    subgraph GQA ["GQA — Grouped-Query Attention<br/>(Llama, Mistral, Granite)"]
+    subgraph GQA ["🟢 GQA — Grouped-Query Attention · Llama, Mistral, Granite"]
         direction LR
-        QG1["Q₁ ─┐"]
-        QG2["Q₂ ─┘─ K₁V₁"]
-        QG3["Q₃ ─┐"]
-        QG4["Q₄ ─┘─ K₂V₂"]
+        GQ1["Q₁"] --> GKV1["K₁ V₁"]
+        GQ2["Q₂"] --> GKV1
+        GQ3["Q₃"] --> GKV2["K₂ V₂"]
+        GQ4["Q₄"] --> GKV2
     end
 
     style MHA fill:#2d3436,stroke:#0984e3,stroke-width:2px,color:#dfe6e9
@@ -870,7 +869,7 @@ graph LR
     style TOKEN fill:#00b894,stroke:#fff,color:#fff
 ```
 
-$$\text{logits} = W_{\text{lm\_head}} \cdot \text{RMSNorm}(h_{\text{final}}) \in \mathbb{R}^{|V|}$$
+$$\text{logits} = W_{\text{lm-head}} \cdot \text{RMSNorm}(h_{\text{final}}) \in \mathbb{R}^{|V|}$$
 
 $$P(\text{token}_i) = \frac{e^{\text{logit}_i}}{\sum_j e^{\text{logit}_j}}$$
 
@@ -960,7 +959,7 @@ sequenceDiagram
 
 ### 14.3 KV Cache Memory Formula
 
-$$\text{Cache Size} = 2 \times L \times n_{kv} \times d_h \times S \times \text{bytes\_per\_element}$$
+$$\text{Cache Size} = 2 \times L \times n_{kv} \times d_h \times S \times \text{bytes-per-element}$$
 
 - $L$ = number of layers
 - $n_{kv}$ = KV heads count
@@ -1167,7 +1166,7 @@ h_0 &= W_E[\text{tokens}] \\
 \quad h_l' &= h_l + \text{GQA}(\hat{h}_l; \text{RoPE}) \\
 \quad \hat{h}_l' &= \text{RMSNorm}(h_l') \\
 \quad h_{l+1} &= h_l' + \text{SwiGLU}(\hat{h}_l') \\
-\text{logits} &= W_{\text{lm\_head}} \cdot \text{RMSNorm}(h_L)
+\text{logits} &= W_{\text{lm-head}} \cdot \text{RMSNorm}(h_L)
 \end{aligned}
 }$$
 

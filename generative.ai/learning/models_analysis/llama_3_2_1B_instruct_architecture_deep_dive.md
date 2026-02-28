@@ -89,9 +89,9 @@ $$x_{l+1} = x_l + \text{Attn}(\text{Norm}(x_l)) + \text{MLP}(\text{Norm}(x_l + \
 
 **Weight Tying Intuition:**
 
-$$\text{embed\_tokens}: \quad e = W_E[t] \quad (t \to \mathbb{R}^{d})$$
+$$\text{embed-tokens}: \quad e = W_E[t] \quad (t \to \mathbb{R}^{d})$$
 
-$$\text{lm\_head}: \quad \text{logits} = W_E^T \cdot h \quad (\mathbb{R}^{d} \to \mathbb{R}^{|V|})$$
+$$\text{lm-head}: \quad \text{logits} = W_E^T \cdot h \quad (\mathbb{R}^{d} \to \mathbb{R}^{|V|})$$
 
 Same matrix $W_E$ ကို embed_tokens (lookup) နဲ့ lm_head (projection) နှစ်ခုလုံးမှာ share သုံးတာ — parameter count ကို ~263M သက်သာစေပါတယ်။
 
@@ -169,7 +169,7 @@ $$Q \in \mathbb{R}^{n \times 32 \times 64}, \quad K \in \mathbb{R}^{n \times 8 \
 
 GQA မှာ K, V ကို broadcast/repeat လုပ်ပြီး Q groups နဲ့ match ပါတယ်:
 
-$$K_{\text{expanded}} = \text{repeat\_kv}(K, \text{n\_rep}=4) \in \mathbb{R}^{n \times 32 \times 64}$$
+$$K_{\text{expanded}} = \text{repeat-kv}(K, \text{n-rep}=4) \in \mathbb{R}^{n \times 32 \times 64}$$
 
 $$\text{Attn}_i = \text{softmax}\left(\frac{Q_i K_{\lfloor i/4 \rfloor}^T}{\sqrt{64}}\right) V_{\lfloor i/4 \rfloor}$$
 
@@ -187,7 +187,7 @@ $$\text{Attn}_i = \text{softmax}\left(\frac{Q_i K_{\lfloor i/4 \rfloor}^T}{\sqrt
 
 **KV Cache per Layer (seq_len=1024, FP16):**
 
-$$\text{KV Cache} = 2 \times n_{\text{kv\_heads}} \times d_{\text{head}} \times \text{seq\_len} \times 2 \text{ bytes}$$
+$$\text{KV Cache} = 2 \times n_{\text{kv-heads}} \times d_{\text{head}} \times \text{seq-len} \times 2 \text{ bytes}$$
 
 | | MHA | GQA | Savings |
 |-|---|---|---|
