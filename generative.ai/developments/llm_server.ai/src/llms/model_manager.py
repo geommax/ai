@@ -1,20 +1,24 @@
-"""Hugging Face model management — download, list, delete."""
+"""Hugging Face model management — download, list, delete.
+
+Downloads use ``huggingface_hub.snapshot_download`` with a native
+``tqdm`` progress callback instead of shelling out to
+``huggingface-cli``.  This is faster, more reliable, and works for
+every model format (GGUF, safetensors, pytorch).
+"""
 
 from __future__ import annotations
 
-import fcntl
 import os
-import re
 import shutil
-import signal
-import subprocess
-import sys
 import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from huggingface_hub import HfApi, scan_cache_dir, snapshot_download
+from huggingface_hub.utils import (
+    tqdm as hf_tqdm,            # HF's wrapped tqdm
+)
 
 
 class DownloadCancelled(Exception):
@@ -30,7 +34,6 @@ class ModelManager:
         )
         self.hub_cache = self.cache_dir / "hub"
         self._cancel_event = threading.Event()
-        self._dl_process: Optional[subprocess.Popen] = None
 
     # ── List downloaded models ─────────────────────────────────────────
     def list_downloaded_models(self) -> List[Dict[str, Any]]:
@@ -122,10 +125,10 @@ class ModelManager:
         on_file_list: Optional[Callable] = None,
         filenames: Optional[List[str]] = None,
     ) -> str:
-        """Download using ``huggingface-cli download`` as a subprocess.
+        """Download *model_id* using ``huggingface_hub.snapshot_download``.
 
-        Cancellation is 100 % reliable — ``process.terminate()`` closes
-        all network connections instantly.
+        Progress is reported through the native ``tqdm`` callback —
+        no subprocess, no stderr parsing.
 
         Parameters
         ----------
@@ -158,165 +161,93 @@ class ModelManager:
         if on_file_list:
             on_file_list(files_info)
 
-        # ── Build command ──────────────────────────────────────────
-        hf_cli = str(Path(sys.executable).parent / "huggingface-cli")
-        cmd = [hf_cli, "download", model_id]
-        if filenames:
-            cmd.extend(filenames)
-        cmd.extend(["--cache-dir", str(self.hub_cache)])
+        # ── Progress tracking state ────────────────────────────────
+        _state: Dict[str, Any] = {
+            "bytes_done": 0,
+            "current_file": files_info[0]["name"] if files_info else "",
+            "start_time": time.monotonic(),
+            "last_update": 0.0,
+        }
 
-        env = os.environ.copy()
-        env.pop("HF_HUB_ENABLE_HF_TRANSFER", None)
+        # Monkey-patch tqdm to intercept download progress
+        _orig_tqdm_init = hf_tqdm.__init__
+        _orig_tqdm_update = hf_tqdm.update
+        _outer_self = self   # reference for cancel check
 
-        # ── Launch ─────────────────────────────────────────────────
-        self._dl_process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env,
-            start_new_session=True,
-        )
-
-        start_time = time.monotonic()
-
-        try:
-            fd = self._dl_process.stderr.fileno()
-            fl = fcntl.fcntl(fd, fcntl.F_GETFL)
-            fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
-
-            buf = ""
-
-            while self._dl_process.poll() is None:
-                # ── Cancel gate ────────────────────────────────────
-                if self._cancel_event.is_set():
-                    self._kill_dl_process()
-                    raise DownloadCancelled(
-                        f"Download of {model_id} cancelled"
-                    )
-
-                # ── Read stderr for tqdm progress ──────────────────
-                try:
-                    raw = os.read(fd, 8192)
-                    if raw:
-                        buf += raw.decode("utf-8", errors="replace")
-                        parts = re.split(r"[\r\n]+", buf)
-                        buf = parts[-1]
-                        for part in parts[:-1]:
-                            self._parse_cli_progress(
-                                part, files_info, total_bytes,
-                                total_files, start_time, on_progress,
-                            )
-                except (OSError, BlockingIOError):
-                    pass
-
-                time.sleep(0.15)
-
-            # ── Process exited ─────────────────────────────────────
-            retcode = self._dl_process.returncode
-
-            if retcode != 0:
-                if self._cancel_event.is_set():
-                    raise DownloadCancelled(
-                        f"Download of {model_id} cancelled"
-                    )
-                err = ""
-                try:
-                    rest = self._dl_process.stderr.read()
-                    if rest:
-                        err = rest.decode("utf-8", errors="replace")
-                except Exception:
-                    pass
-                raise RuntimeError(
-                    f"huggingface-cli download failed (exit {retcode}):\n{err}"
-                )
-
-            # stdout = local path printed by huggingface-cli
-            path = ""
-            try:
-                path = (
-                    self._dl_process.stdout
-                    .read()
-                    .decode("utf-8", errors="replace")
-                    .strip()
-                )
-            except Exception:
-                pass
-
-            # Notify all files done
-            if on_progress:
-                for idx, f in enumerate(files_info, 1):
-                    on_progress(
-                        f["name"], idx, total_files,
-                        total_bytes, total_bytes, "done", 0.0,
-                    )
-
-            return path or str(self.hub_cache)
-
-        finally:
-            self._dl_process = None
-
-    # ── Subprocess helpers ─────────────────────────────────────────────
-
-    def _kill_dl_process(self) -> None:
-        """Send SIGTERM (then SIGKILL) to the download process group."""
-        proc = self._dl_process
-        if proc is None or proc.poll() is not None:
-            return
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except (OSError, ProcessLookupError):
-            pass
-        try:
-            proc.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except (OSError, ProcessLookupError):
-                pass
-            try:
-                proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                pass
-
-    @staticmethod
-    def _parse_cli_progress(
-        line: str,
-        files_info: List[Dict[str, Any]],
-        total_bytes: int,
-        total_files: int,
-        start_time: float,
-        on_progress: Optional[Callable],
-    ) -> None:
-        """Extract progress percentage from tqdm CLI output."""
-        if not on_progress or "%" not in line:
-            return
-        m = re.search(r"(\d+)%\|", line)
-        if not m:
-            return
-        pct = int(m.group(1))
-        bytes_done = int(total_bytes * pct / 100)
-        elapsed = time.monotonic() - start_time
-        speed = bytes_done / elapsed if elapsed > 1.0 else 0.0
-
-        # Try to extract filename from "filename:  XX%|…"
-        fname = files_info[0]["name"] if files_info else ""
-        fn_m = re.match(r"^(.*?):\s+\d+%", line)
-        if fn_m:
-            raw = fn_m.group(1).strip()
+        def _patched_init(tqdm_self: Any, *args: Any, **kwargs: Any) -> None:
+            _orig_tqdm_init(tqdm_self, *args, **kwargs)
+            desc = getattr(tqdm_self, "desc", "") or ""
+            # tqdm description often contains the filename
             for f in files_info:
-                if f["name"] == raw or f["name"].endswith(raw):
-                    fname = f["name"]
+                if f["name"] in desc or desc.endswith(f["name"]):
+                    _state["current_file"] = f["name"]
                     break
 
-        on_progress(
-            fname, 1, total_files, bytes_done, total_bytes,
-            "downloading", speed,
-        )
+        def _patched_update(tqdm_self: Any, n: int = 1) -> None:
+            # Cancel check
+            if _outer_self._cancel_event.is_set():
+                # Close the tqdm bar and raise to abort
+                tqdm_self.close()
+                raise DownloadCancelled(
+                    f"Download of {model_id} cancelled"
+                )
+
+            _orig_tqdm_update(tqdm_self, n)
+
+            _state["bytes_done"] += n
+
+            # Throttle UI updates to ~4×/sec
+            now = time.monotonic()
+            if on_progress and (now - _state["last_update"]) >= 0.25:
+                _state["last_update"] = now
+                elapsed = now - _state["start_time"]
+                speed = (
+                    _state["bytes_done"] / elapsed if elapsed > 1.0 else 0.0
+                )
+                on_progress(
+                    _state["current_file"],
+                    1,
+                    total_files,
+                    _state["bytes_done"],
+                    total_bytes,
+                    "downloading",
+                    speed,
+                )
+
+        # ── Perform download ───────────────────────────────────────
+        try:
+            hf_tqdm.__init__ = _patched_init       # type: ignore[assignment]
+            hf_tqdm.update = _patched_update        # type: ignore[assignment]
+
+            allow_patterns = filenames or None
+
+            path = snapshot_download(
+                model_id,
+                cache_dir=str(self.hub_cache),
+                allow_patterns=allow_patterns,
+            )
+        except DownloadCancelled:
+            raise
+        except Exception:
+            raise
+        finally:
+            # Always restore original tqdm methods
+            hf_tqdm.__init__ = _orig_tqdm_init      # type: ignore[assignment]
+            hf_tqdm.update = _orig_tqdm_update       # type: ignore[assignment]
+
+        # ── Notify completion ──────────────────────────────────────
+        if on_progress:
+            for idx, f in enumerate(files_info, 1):
+                on_progress(
+                    f["name"], idx, total_files,
+                    total_bytes, total_bytes, "done", 0.0,
+                )
+
+        return path
 
     def cancel_download(self) -> None:
-        """Terminate the download subprocess immediately."""
+        """Signal the in-progress download to stop."""
         self._cancel_event.set()
-        self._kill_dl_process()
 
     @property
     def is_download_cancelled(self) -> bool:
