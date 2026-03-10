@@ -8,15 +8,18 @@ Modules:
   ui             – Gradio Blocks interface
 """
 
-from .config import APP_CONFIG, ModelFormat
-from .model_manager import scan_cached_models, load_model, unload_model, is_loaded
+from .config import APP_CONFIG, ModelFormat, PROMPT_TEMPLATES, DEFAULT_SYSTEM_PROMPT
+from .model_manager import scan_cached_models, scan_local_directory, load_model, unload_model, is_loaded
 from .generation import generate_response
 from .ui import build_standalone_interface
 
 __all__ = [
     "APP_CONFIG",
     "ModelFormat",
+    "PROMPT_TEMPLATES",
+    "DEFAULT_SYSTEM_PROMPT",
     "scan_cached_models",
+    "scan_local_directory",
     "load_model",
     "unload_model",
     "is_loaded",

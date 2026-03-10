@@ -358,10 +358,6 @@ flowchart TD
     REPARAMETER --> QLORA["QLoRA<br/>Quantize +<br/>LoRA"]
     REPARAMETER --> DORA["DoRA<br/>Direction +<br/>Magnitude"]
     REPARAMETER --> LORAPLUS["LoRA+<br/>Adaptive<br/>Learning Rate"]
-
-    style LORA fill:#c8e6c9,stroke:#388e3c,stroke-width:3px
-    style QLORA fill:#c8e6c9,stroke:#388e3c,stroke-width:3px
-    style DORA fill:#c8e6c9,stroke:#388e3c,stroke-width:3px
 ```
 
 ### LoRA Variant Comparison

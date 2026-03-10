@@ -126,6 +126,57 @@ def scan_cached_models(cache_dir: Path | None = None) -> list[CachedModel]:
     return results
 
 
+def scan_local_directory(dir_path: str) -> list[CachedModel]:
+    """
+    Scan a user-specified local directory for model files.
+
+    Supports:
+      - Direct model directory (contains .safetensors or .gguf files)
+      - Parent directory containing multiple model subdirectories
+
+    Returns list of CachedModel with snapshot_path set to the actual directory.
+    """
+    root = Path(dir_path).resolve()
+    if not root.is_dir():
+        return []
+
+    results: list[CachedModel] = []
+
+    # Check if root itself contains model files
+    _try_add_model(root, results)
+
+    # Scan immediate subdirectories
+    for entry in sorted(root.iterdir()):
+        if entry.is_dir():
+            _try_add_model(entry, results)
+
+    return results
+
+
+def _try_add_model(directory: Path, results: list[CachedModel]) -> None:
+    """Check if a directory contains model files and add to results if so."""
+    if not directory.is_dir():
+        return
+
+    has_model_files = any(
+        f.is_file() and f.suffix.lower() in (".safetensors", ".gguf", ".bin")
+        for f in directory.iterdir()
+    )
+
+    if not has_model_files:
+        return
+
+    fmt, gguf_files = _detect_format(directory)
+    results.append(
+        CachedModel(
+            model_id=directory.name,
+            model_format=fmt,
+            snapshot_path=directory,
+            gguf_files=gguf_files,
+        )
+    )
+
+
 # ── Model Loader / Unloader ─────────────────────────────────────────────
 
 _state: Optional[LoadedModelState] = None
@@ -193,9 +244,18 @@ def unload_model() -> str:
         torch.cuda.empty_cache()
         if hasattr(torch.cuda, "ipc_collect"):
             torch.cuda.ipc_collect()
+        torch.cuda.reset_peak_memory_stats()
 
     # Final GC round after CUDA cleanup
     gc.collect()
+
+    # ── 4b. Force OS-level memory release (Linux glibc malloc_trim) ──
+    try:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6")
+        libc.malloc_trim(0)
+    except Exception:
+        pass
 
     # ── 5. Build status report ───────────────────────────────────────
     gpu_after = _get_gpu_memory_mb()
@@ -218,40 +278,47 @@ def _cleanup_safetensors_model(state: LoadedModelState) -> None:
     if model is None:
         return
 
-    # Remove accelerate dispatch hooks (they hold tensor references)
+    # ── 1. Remove accelerate dispatch hooks (they hold tensor references) ──
     try:
         from accelerate.hooks import remove_hook_from_submodules
         remove_hook_from_submodules(model)
     except Exception:
         pass
 
-    # Untie any shared weight references
+    # ── 2. Use accelerate's release_memory if available ──────────────────
     try:
-        if hasattr(model, "tie_weights"):
-            # Some models tie lm_head ↔ embedding; untie to avoid dangling refs
-            pass
+        from accelerate.utils import release_memory
+        model = release_memory(model)
     except Exception:
         pass
 
-    # Move all parameters to CPU first to release GPU allocations
+    # ── 3. Clear all parameter & buffer tensors in-place ─────────────────
+    #    Setting data to an empty tensor breaks GPU references that
+    #    model.to("cpu") may miss with device_map="auto" models.
     try:
-        model.to("cpu")
+        for param in model.parameters():
+            param.data = torch.empty(0, device="cpu")
+            if param.grad is not None:
+                param.grad = None
+        for buf in model.buffers():
+            buf.data = torch.empty(0, device="cpu")
     except Exception:
         pass
 
-    # Delete sub-components that may hold separate references
-    for attr in ("lm_head", "model", "transformer", "encoder", "decoder"):
+    # ── 4. Delete known sub-module attributes ────────────────────────────
+    for attr in ("lm_head", "model", "transformer", "encoder", "decoder",
+                 "embed_tokens", "layers", "norm"):
         try:
             if hasattr(model, attr):
                 delattr(model, attr)
         except Exception:
             pass
 
-    # Explicitly delete the model object
+    # ── 5. Explicitly delete the model object ────────────────────────────
     del model
     state.model = None
 
-    # Tokenizer can hold memory via fast-tokenizer rust backend
+    # ── 6. Tokenizer (fast-tokenizer rust backend can hold memory) ───────
     if state.tokenizer is not None:
         del state.tokenizer
         state.tokenizer = None
@@ -274,12 +341,13 @@ def _cleanup_gguf_model(state: LoadedModelState) -> None:
     except Exception:
         pass
 
-    # Some versions use _model attribute for the underlying C object
-    try:
-        if hasattr(model, "_model") and model._model is not None:
-            del model._model
-    except Exception:
-        pass
+    # Some versions use _model / _ctx attribute for the underlying C object
+    for attr in ("_model", "_ctx", "model", "ctx"):
+        try:
+            if hasattr(model, attr) and getattr(model, attr) is not None:
+                delattr(model, attr)
+        except Exception:
+            pass
 
     del model
     state.model = None
@@ -289,9 +357,16 @@ def load_model(
     model_id: str,
     model_format: ModelFormat,
     gguf_filename: str = "",
+    local_path: str = "",
 ) -> str:
     """
     Load the model — either SafeTensors (Transformers) or GGUF (llama.cpp).
+
+    Args:
+        model_id:      HuggingFace model ID or directory name.
+        model_format:  SAFETENSORS or GGUF.
+        gguf_filename: GGUF filename (required for GGUF models).
+        local_path:    Absolute path to a local model directory (optional).
 
     Returns:
         status message string.
@@ -304,9 +379,9 @@ def load_model(
 
     try:
         if model_format == ModelFormat.SAFETENSORS:
-            return _load_safetensors(model_id)
+            return _load_safetensors(model_id, local_path)
         else:
-            return _load_gguf(model_id, gguf_filename)
+            return _load_gguf(model_id, gguf_filename, local_path)
     except Exception as exc:
         _state = None
         return f"❌ Load failed: {exc}"
@@ -314,13 +389,15 @@ def load_model(
 
 # ── Private loaders ─────────────────────────────────────────────────────
 
-def _load_safetensors(model_id: str) -> str:
+def _load_safetensors(model_id: str, local_path: str = "") -> str:
     global _state
     from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline as hf_pipeline
 
-    tokenizer = AutoTokenizer.from_pretrained(model_id, local_files_only=True)
+    source = local_path if local_path else model_id
+
+    tokenizer = AutoTokenizer.from_pretrained(source, local_files_only=True)
     model = AutoModelForCausalLM.from_pretrained(
-        model_id,
+        source,
         device_map="auto",
         torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
         local_files_only=True,
@@ -335,7 +412,7 @@ def _load_safetensors(model_id: str) -> str:
     return f"✅ **{model_id}** loaded (SafeTensors, device={model.device})."
 
 
-def _load_gguf(model_id: str, gguf_filename: str) -> str:
+def _load_gguf(model_id: str, gguf_filename: str, local_path: str = "") -> str:
     global _state
 
     if not gguf_filename:
@@ -349,13 +426,22 @@ def _load_gguf(model_id: str, gguf_filename: str) -> str:
             "Install: `pip install llama-cpp-python`"
         )
 
-    model = Llama.from_pretrained(
-        repo_id=model_id,
-        filename=gguf_filename,
-        n_ctx=2048,
-        n_gpu_layers=-1 if torch.cuda.is_available() else 0,
-        verbose=False,
-    )
+    if local_path:
+        gguf_path = str(Path(local_path) / gguf_filename)
+        model = Llama(
+            model_path=gguf_path,
+            n_ctx=2048,
+            n_gpu_layers=-1 if torch.cuda.is_available() else 0,
+            verbose=False,
+        )
+    else:
+        model = Llama.from_pretrained(
+            repo_id=model_id,
+            filename=gguf_filename,
+            n_ctx=2048,
+            n_gpu_layers=-1 if torch.cuda.is_available() else 0,
+            verbose=False,
+        )
 
     _state = LoadedModelState(
         model_id=model_id,
